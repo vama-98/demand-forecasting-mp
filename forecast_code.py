@@ -654,16 +654,22 @@ def generate_forecast_recursive(
         _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
     ], axis=1)
 
-    # Recursive buffers
+    # -------------------------
+    # Recursive buffers (FIXED)
+    # -------------------------
     hist_units = hist["Units_Sold"].tolist()
 
-    # anchor level: last 7 days mean
-    anchor = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
+    # Stable reference levels from actual history only (prevents drift)
+    roll7_ref = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
+    roll30_ref = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
+
+    # Anchor starts from actual recent mean and moves slowly (much less mean-reversion)
+    anchor = roll7_ref
 
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if "Spend_Adstock" in hist.columns and len(hist) else 0.0
 
-    preds = []
-    logs = []
+    preds, logs = [], []
+    cap = float(max_daily_change_pct)
 
     for i in range(len(fc)):
         # update adstock
@@ -671,11 +677,13 @@ def generate_forecast_recursive(
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = float(np.log1p(prev_adstock))
 
-        # lags/rolling
+        # lags from evolving series (ok)
         fc.loc[i, "Units_Lag_1"] = float(hist_units[-1]) if len(hist_units) >= 1 else 0.0
-        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else 0.0
-        fc.loc[i, "Units_Rolling_7"] = float(np.mean(hist_units[-7:])) if len(hist_units) >= 1 else 0.0
-        fc.loc[i, "Units_Rolling_30"] = float(np.mean(hist_units[-30:])) if len(hist_units) >= 1 else 0.0
+        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else float(hist_units[-1]) if len(hist_units) else 0.0
+
+        # ✅ freeze rolling stats to history-only references (no self-feeding drift)
+        fc.loc[i, "Units_Rolling_7"] = roll7_ref
+        fc.loc[i, "Units_Rolling_30"] = roll30_ref
 
         # cross-channel gap
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
@@ -683,16 +691,15 @@ def generate_forecast_recursive(
         # predict
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_log = float(units_model.predict(X_i)[0])
-        pred_raw = float(np.expm1(pred_log))
-        pred_raw = max(pred_raw, 0.0)
+        pred_raw = max(float(np.expm1(pred_log)), 0.0)
 
-        # stabilize: blend with anchor + cap daily change
-        pred = 0.75 * pred_raw + 0.25 * anchor
+        # ✅ softer anchor blend (less pull-down)
+        pred = 0.90 * pred_raw + 0.10 * anchor
 
-        prev_u = float(hist_units[-1]) if len(hist_units) else pred
-        cap = float(max_daily_change_pct)
-        if prev_u > 0:
-            pred = float(np.clip(pred, prev_u * (1.0 - cap), prev_u * (1.0 + cap)))
+        # ✅ cap relative to stable reference (prevents random-walk down)
+        ref = roll7_ref if roll7_ref > 0 else (float(hist_units[-1]) if len(hist_units) else pred)
+        if ref > 0:
+            pred = float(np.clip(pred, ref * (1.0 - cap), ref * (1.0 + cap)))
 
         pred = max(pred, 0.0)
 
@@ -700,13 +707,16 @@ def generate_forecast_recursive(
         logs.append(pred_log)
 
         hist_units.append(pred)
-        anchor = 0.9 * anchor + 0.1 * pred
+
+        # ✅ anchor moves very slowly (optional; keeps smoothness)
+        anchor = 0.98 * anchor + 0.02 * pred
 
     fc["Predicted_Units"] = np.array(preds, dtype=float)
     fc["Predicted_Log_Units"] = np.array(logs, dtype=float)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
 
     return fc
+
 
 
 # =============================================================================
@@ -1123,6 +1133,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
