@@ -597,19 +597,19 @@ def generate_forecast_recursive(
     title_to_code: dict,
     adstock_alpha: float = ADSTOCK_ALPHA_DEFAULT,
     max_daily_change_pct: float = 0.20,
-    # --- new stability knobs (safe defaults) ---
-    anchor_weight: float = 0.08,          # lower = less mean-reversion
-    anchor_update_rate: float = 0.03,     # lower = slower anchor drift
-    roll7_update_rate: float = 0.15,      # adds shape without runaway drift
-    roll30_update_rate: float = 0.05,     # very slow baseline drift
+    # --- Anti-drift controls ---
+    drift_floor_pct: float = 0.12,   # floor at (1 - pct) * last7_actual_mean
+    ref_mix: float = 0.65,           # 0..1 mix between yesterday and stable ref for clipping
+    anchor_weight: float = 0.12,     # small stabilizer towards baseline level
+    anchor_update_rate: float = 0.02,# slow anchor drift
+    roll7_update_rate: float = 0.18, # give shape, but not too reactive
+    roll30_update_rate: float = 0.05 # very slow
 ):
     """
-    Recursive forecast that avoids the 'diminishing melt' while also avoiding a flat straight line.
-
-    Key ideas:
-    - Use *stateful* rolling features (roll7/roll30) updated with exponential smoothing (not raw mean of preds)
-    - Keep a *light* anchor blend (pred = (1-w)*pred_raw + w*anchor) so it stays stable but can move
-    - Cap day-to-day movement around yesterday's value (prevents explosions but keeps shape)
+    Recursive forecast with anti-drift guard:
+    - Uses smoothed rolling states (roll7/roll30) for shape
+    - Clips day-to-day movement around a blended reference (yesterday + stable baseline)
+    - Applies a soft floor around last-7-day actual mean to prevent melt when drivers are flat
     """
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
@@ -632,9 +632,7 @@ def generate_forecast_recursive(
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
 
     # -------------------------
-    # Spend schedule (as your current logic)
-    # NOTE: this treats monthly_spend as "total for the selected window".
-    # We'll keep it unchanged here since you're focusing on diminishing first.
+    # Spend schedule (keeping your current interpretation)
     # -------------------------
     num_days = len(fc)
     daily_spend = float(monthly_spend) / num_days if num_days else 0.0
@@ -687,73 +685,87 @@ def generate_forecast_recursive(
     if not hist_units:
         return None
 
-    # Seed stable states from actual history
-    roll7 = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
-    roll30 = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
+    last7_mean = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
+    last30_mean = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
 
-    anchor = roll7  # baseline level reference
+    # stable baseline reference level from ACTUAL history
+    baseline_level = max(last7_mean, 0.0)
+    floor_level = max(0.0, (1.0 - float(drift_floor_pct)) * baseline_level)
 
-    # Adstock seed from history (if present)
+    # smoothed rolling states (start from actual)
+    roll7 = last7_mean
+    roll30 = last30_mean
+
+    # anchor is a slow-moving baseline
+    anchor = baseline_level
+
+    # adstock seed
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if ("Spend_Adstock" in hist.columns and len(hist)) else 0.0
 
     preds, logs = [], []
     cap = float(max_daily_change_pct)
 
-    # Guard weights
+    # clamp knobs
+    ref_mix = float(np.clip(ref_mix, 0.0, 1.0))
     aw = float(np.clip(anchor_weight, 0.0, 0.5))
     au = float(np.clip(anchor_update_rate, 0.0, 0.5))
     r7u = float(np.clip(roll7_update_rate, 0.0, 0.5))
     r30u = float(np.clip(roll30_update_rate, 0.0, 0.5))
 
     for i in range(len(fc)):
-        # -------------------------
-        # Update adstock state
-        # -------------------------
+        # adstock update
         prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = float(np.log1p(prev_adstock))
 
-        # -------------------------
-        # Lags from evolving series
-        # -------------------------
+        # lags
         lag1 = float(hist_units[-1]) if len(hist_units) else 0.0
         lag7 = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
-
         fc.loc[i, "Units_Lag_1"] = lag1
         fc.loc[i, "Units_Lag_7"] = lag7
 
-        # ✅ Stateful rollings (adds shape, avoids runaway drift)
+        # roll states (smoothed)
         fc.loc[i, "Units_Rolling_7"] = roll7
         fc.loc[i, "Units_Rolling_30"] = roll30
 
-        # Cross-channel gap
+        # gap
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
 
-        # -------------------------
-        # Predict
-        # -------------------------
+        # predict
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_log = float(units_model.predict(X_i)[0])
         pred_raw = max(float(np.expm1(pred_log)), 0.0)
 
-        # ✅ Light anchor blend (stability without forced decay)
+        # light anchor blend (keeps stability)
         pred = (1.0 - aw) * pred_raw + aw * anchor
 
-        # ✅ Cap around yesterday to prevent explosions but keep variation
-        prev_u = lag1 if lag1 > 0 else pred
-        if prev_u > 0:
-            pred = float(np.clip(pred, prev_u * (1.0 - cap), prev_u * (1.0 + cap)))
+        # -------------------------
+        # Anti-drift clipping
+        # -------------------------
+        # stable reference is baseline + roll7 (both from slowly moving state)
+        stable_ref = 0.7 * baseline_level + 0.3 * roll7
+        stable_ref = max(stable_ref, 0.0)
+
+        # blend yesterday with stable_ref so we keep variation without random-walk down
+        ref = ref_mix * lag1 + (1.0 - ref_mix) * stable_ref
+        ref = ref if ref > 0 else (stable_ref if stable_ref > 0 else pred)
+
+        if ref > 0:
+            pred = float(np.clip(pred, ref * (1.0 - cap), ref * (1.0 + cap)))
+
+        # soft floor around actual baseline level (prevents “melt” when drivers are flat)
+        if baseline_level > 0:
+            pred = max(pred, floor_level)
 
         pred = max(pred, 0.0)
 
         preds.append(pred)
         logs.append(pred_log)
 
-        # -------------------------
-        # Update states (slowly)
-        # -------------------------
+        # update buffers
         hist_units.append(pred)
 
+        # update states slowly (shape, but no chase)
         roll7 = (1.0 - r7u) * roll7 + r7u * pred
         roll30 = (1.0 - r30u) * roll30 + r30u * pred
         anchor = (1.0 - au) * anchor + au * pred
@@ -763,8 +775,6 @@ def generate_forecast_recursive(
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
 
     return fc
-
-
 
 
 # =============================================================================
@@ -1181,6 +1191,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
