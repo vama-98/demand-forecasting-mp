@@ -1200,14 +1200,14 @@ def main():
         if sale_dates:
             target_sales.append({"discount": float(sale_discount), "dates": sale_dates})
 
-    top_imp, full_imp = show_feature_importance(units_model, feature_cols, top_n=40)
+    #top_imp, full_imp = show_feature_importance(units_model, feature_cols, top_n=40)
 
-    st.subheader("🔍 Model Feature Importance (Gain)")
-    st.dataframe(top_imp, use_container_width=True, height=500)
+    #st.subheader("🔍 Model Feature Importance (Gain)")
+    #st.dataframe(top_imp, use_container_width=True, height=500)
 
-    st.subheader("🧾 Shopify Feature Importance (Gain)")
-    shop = full_imp[full_imp["Feature"].isin(["Shopify_Discount", "Shopify_Units", "Discount_Gap"])]
-    st.dataframe(shop, use_container_width=True)
+    #st.subheader("🧾 Shopify Feature Importance (Gain)")
+    #shop = full_imp[full_imp["Feature"].isin(["Shopify_Discount", "Shopify_Units", "Discount_Gap"])]
+    #st.dataframe(shop, use_container_width=True)
 
     
     st.markdown("---")
@@ -1340,6 +1340,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
