@@ -79,6 +79,20 @@ SIGMA_FILE = "model_sigmas.pkl"
 ADSTOCK_ALPHA_DEFAULT = 0.30
 CALIB_MIN = 0.70
 CALIB_MAX = 1.30
+import os
+
+def _debug_file(path: str):
+    st.write(f"🔎 Checking: {path}")
+    st.write("exists:", os.path.exists(path))
+    if os.path.exists(path):
+        st.write("size_bytes:", os.path.getsize(path))
+        with open(path, "rb") as f:
+            head = f.read(16)
+        st.write("first_16_bytes:", head)
+
+# inside load_data(), before reading:
+_debug_file(SALES_FILE)
+_debug_file(SPENDS_FILE)
 
 # =============================================================================
 # DATA LOADING
@@ -1043,3 +1057,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
