@@ -118,7 +118,7 @@ def load_data():
         .str.strip()
         )
 
-st.write("Offers columns:", [repr(c) for c in offers_df.columns])  # debug once
+        st.write("Offers columns:", [repr(c) for c in offers_df.columns])  # debug once
 
         offers_df.columns = offers_df.columns.str.strip()
 
@@ -1066,5 +1066,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
