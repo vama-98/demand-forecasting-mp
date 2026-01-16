@@ -1070,46 +1070,6 @@ def main():
             target_sales.append({"discount": float(sale_discount), "dates": sale_dates})
 
     st.markdown("---")
-    metrics = load_training_metrics()
-
-    if metrics:
-        st.subheader("📐 Model Accuracy (Holdout Test Set)")
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "WAPE (Overall)",
-            f"{metrics['wape_units']*100:.1f}%",
-            help="Weighted Absolute % Error across all SKUs (primary business metric)"
-        )
-
-        c2.metric(
-            "MAE (Units)",
-            f"{metrics['mae_units']:.1f}",
-            help="Average daily absolute error per SKU-channel"
-        )
-
-        c3.metric(
-            "MAPE",
-            f"{metrics['mape_units']*100:.1f}%",
-            help="Inflated by low-volume SKUs; shown for completeness"
-        )
-
-        c4.metric(
-            "Confidence Spread (σ)",
-            f"{metrics['sigma_units_log']:.2f}",
-            help="Log-space std dev used for forecast confidence bands"
-        )
-
-        st.caption(
-            f"Trained on {metrics['rows']:,} rows | "
-            f"{metrics['features']} features | "
-            f"Train end: {metrics['train_end_date']} | "
-            f"Test start: {metrics['test_start_date']}"
-        )
-    else:
-        st.info("ℹ️ Train the model to see accuracy metrics.")
-
     if st.button("🔮 Generate Forecast", type="primary", use_container_width=True):
         with st.spinner("Generating forecasts..."):
             scenario_fc = generate_forecast_recursive(
@@ -1239,6 +1199,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
