@@ -93,16 +93,9 @@ def _debug_file(path: str):
 # inside load_data(), before reading:
 _debug_file(SALES_FILE)
 _debug_file(SPENDS_FILE)
-def load_offers_excel(path: str) -> pd.DataFrame:
-    """
-    Loads offer.xlsx robustly even if the header row is shifted or contains junk rows.
-    It searches the first ~10 rows for a row containing 'title' and 'offer' and 'discount'
-    (case-insensitive) and uses that as the header.
-    """
-    import pandas as pd
 
-    # read without header first to inspect rows
-    raw = pd.read_excel(path, engine="openpyxl", header=None)
+def load_offers_excel(path: str) -> pd.DataFrame:
+    import pandas as pd
 
     def norm(x):
         if pd.isna(x):
@@ -112,29 +105,59 @@ def load_offers_excel(path: str) -> pd.DataFrame:
         s = " ".join(s.split())
         return s.strip().lower()
 
-    header_row_idx = None
-    for i in range(min(10, len(raw))):
-        row_vals = [norm(v) for v in raw.iloc[i].tolist()]
-        row_set = set(row_vals)
-        if ("title" in row_set) and ("offer" in row_set) and ("discount" in row_set):
-            header_row_idx = i
-            break
+    xls = pd.ExcelFile(path, engine="openpyxl")
+    st.write("offer.xlsx sheets:", xls.sheet_names)  # safe to print
 
-    if header_row_idx is None:
-        # fallback: assume first row is header
-        df = pd.read_excel(path, engine="openpyxl", header=0)
-    else:
-        df = pd.read_excel(path, engine="openpyxl", header=header_row_idx)
+    best_df = pd.DataFrame()
 
-    # clean column names
-    df.columns = (
-        df.columns.astype(str)
-        .str.replace("\ufeff", "", regex=False)
-        .str.replace("\xa0", " ", regex=False)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-    return df
+    # Try each sheet
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(path, engine="openpyxl", sheet_name=sheet, header=None)
+
+        # Search more rows + substring detection (handles merged cells/weird spacing)
+        header_row_idx = None
+        for i in range(min(50, len(raw))):
+            row_vals = [norm(v) for v in raw.iloc[i].tolist()]
+            blob = " | ".join([v for v in row_vals if v])  # joined row text
+
+            has_title = "title" in blob
+            has_offer = "offer" in blob
+            has_discount = "discount" in blob
+
+            if has_title and has_offer and has_discount:
+                header_row_idx = i
+                break
+
+        if header_row_idx is None:
+            continue
+
+        df = pd.read_excel(path, engine="openpyxl", sheet_name=sheet, header=header_row_idx)
+
+        # Clean column names
+        df.columns = (
+            df.columns.astype(str)
+            .str.replace("\ufeff", "", regex=False)
+            .str.replace("\xa0", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+        )
+
+        # If it has the expected columns, standardize and return immediately
+        cols_norm = {c: c.strip().lower().replace(" ", "") for c in df.columns}
+        title_col = next((c for c, n in cols_norm.items() if "title" == n), None)
+        offer_col = next((c for c, n in cols_norm.items() if "offer" == n), None)
+        disc_col  = next((c for c, n in cols_norm.items() if "discount" in n), None)
+
+        if title_col and offer_col and disc_col:
+            df = df.rename(columns={title_col: "Title", offer_col: "Offer", disc_col: "Discount"})
+            return df
+
+        # Keep best attempt (for debugging)
+        best_df = df
+
+    # If nothing matched, return whatever we got (or empty)
+    return best_df if not best_df.empty else pd.DataFrame()
+
 
 # =============================================================================
 # DATA LOADING
@@ -1100,6 +1123,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
