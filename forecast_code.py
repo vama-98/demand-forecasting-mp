@@ -111,6 +111,7 @@ def load_data():
         spends_df.rename(columns={"Master_title": "Master_Title"}, inplace=True)
 
         offers_df = pd.read_excel(OFFERS_FILE)
+        st.write([repr(c) for c in offers_df.columns])
         offers_df.columns = (
         offers_df.columns.astype(str)
         .str.replace("\ufeff", "", regex=False)   # remove BOM if present
@@ -1066,6 +1067,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
