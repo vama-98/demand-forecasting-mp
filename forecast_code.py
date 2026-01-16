@@ -228,6 +228,27 @@ def estimate_spend_elasticity(
 
     return float(np.clip(e, 0.05, 0.30))
 
+def show_feature_importance(units_model, feature_cols, top_n=30):
+    import pandas as pd
+
+    booster = units_model.get_booster()
+
+    # Gain-based importance (best for interpretation)
+    score = booster.get_score(importance_type="gain")
+
+    # Map f0, f1, ... to feature names
+    imp = []
+    for k, v in score.items():
+        idx = int(k.replace("f", ""))
+        if idx < len(feature_cols):
+            imp.append((feature_cols[idx], v))
+
+    imp_df = pd.DataFrame(imp, columns=["Feature", "Gain"])
+    imp_df = imp_df.sort_values("Gain", ascending=False)
+
+    return imp_df.head(top_n)
+
+
 def load_training_metrics(path: str = "training_metrics.json") -> dict | None:
     import json, os
     if not os.path.exists(path):
@@ -1000,6 +1021,11 @@ def main():
         band_level = st.selectbox("Band level", ["90%", "95%"], index=0)
         z = 1.64 if band_level == "90%" else 1.96
 
+    st.subheader("🔍 Model Feature Importance (Gain)")
+
+    imp_df = show_feature_importance(units_model, feature_cols, top_n=40)
+    st.dataframe(imp_df, use_container_width=True, height=500)
+
     units_model, feature_cols, channel_to_code, title_to_code, sigma_units_log = load_models()
     if units_model is None:
         st.warning("⚠️ Please train the model from the sidebar.")
@@ -1271,6 +1297,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
