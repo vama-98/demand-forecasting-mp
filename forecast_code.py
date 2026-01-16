@@ -1098,10 +1098,9 @@ def main():
                 use_container_width=True,
             )
 
-st.write("offer.xlsx shape:", offers_df.shape)
-
 if __name__ == "__main__":
     main()
+
 
 
 
