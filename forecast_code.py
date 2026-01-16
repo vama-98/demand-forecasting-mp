@@ -93,6 +93,48 @@ def _debug_file(path: str):
 # inside load_data(), before reading:
 _debug_file(SALES_FILE)
 _debug_file(SPENDS_FILE)
+def load_offers_excel(path: str) -> pd.DataFrame:
+    """
+    Loads offer.xlsx robustly even if the header row is shifted or contains junk rows.
+    It searches the first ~10 rows for a row containing 'title' and 'offer' and 'discount'
+    (case-insensitive) and uses that as the header.
+    """
+    import pandas as pd
+
+    # read without header first to inspect rows
+    raw = pd.read_excel(path, engine="openpyxl", header=None)
+
+    def norm(x):
+        if pd.isna(x):
+            return ""
+        s = str(x)
+        s = s.replace("\ufeff", "").replace("\xa0", " ")
+        s = " ".join(s.split())
+        return s.strip().lower()
+
+    header_row_idx = None
+    for i in range(min(10, len(raw))):
+        row_vals = [norm(v) for v in raw.iloc[i].tolist()]
+        row_set = set(row_vals)
+        if ("title" in row_set) and ("offer" in row_set) and ("discount" in row_set):
+            header_row_idx = i
+            break
+
+    if header_row_idx is None:
+        # fallback: assume first row is header
+        df = pd.read_excel(path, engine="openpyxl", header=0)
+    else:
+        df = pd.read_excel(path, engine="openpyxl", header=header_row_idx)
+
+    # clean column names
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.replace("\xa0", " ", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    return df
 
 # =============================================================================
 # DATA LOADING
@@ -109,20 +151,7 @@ def load_data():
         spends_df.columns = spends_df.columns.str.strip()
         spends_df["date_start"] = pd.to_datetime(spends_df["date_start"], errors="coerce")
         spends_df.rename(columns={"Master_title": "Master_Title"}, inplace=True)
-
-        offers_df = pd.read_excel(OFFERS_FILE)
-        st.write([repr(c) for c in offers_df.columns])
-        offers_df.columns = (
-        offers_df.columns.astype(str)
-        .str.replace("\ufeff", "", regex=False)   # remove BOM if present
-        .str.replace("\xa0", " ", regex=False)    # replace non-breaking spaces
-        .str.strip()
-        )
-
-        st.write("Offers columns:", [repr(c) for c in offers_df.columns])  # debug once
-
-        offers_df.columns = offers_df.columns.str.strip()
-
+        offers_df = load_offers_excel(OFFERS_FILE)
         # Remove Offline
         if "source_channel" in sales_df.columns:
             sales_df = sales_df[sales_df["source_channel"] != "Offline"].copy()
@@ -859,7 +888,12 @@ def main():
 
     # Offers UI
     st.subheader("🎁 Shopify Offers (Scenario)")
-    product_offers = offers_df[offers_df["Title"] == selected_product] if offers_df is not None else pd.DataFrame()
+    if offers_df is None or offers_df.empty or "Title" not in offers_df.columns:
+        st.warning("No usable offers found in offer.xlsx (missing Title/Offer/Discount headers).")
+        product_offers = pd.DataFrame()
+    else:
+        product_offers = offers_df[offers_df["Title"].astype(str).str.strip() == str(selected_product).strip()]
+
 
     shopify_offers = []
     if not product_offers.empty:
@@ -1064,9 +1098,11 @@ def main():
                 use_container_width=True,
             )
 
+st.write("offer.xlsx shape:", offers_df.shape)
 
 if __name__ == "__main__":
     main()
+
 
 
 
