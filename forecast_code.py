@@ -597,7 +597,20 @@ def generate_forecast_recursive(
     title_to_code: dict,
     adstock_alpha: float = ADSTOCK_ALPHA_DEFAULT,
     max_daily_change_pct: float = 0.20,
+    # --- new stability knobs (safe defaults) ---
+    anchor_weight: float = 0.08,          # lower = less mean-reversion
+    anchor_update_rate: float = 0.03,     # lower = slower anchor drift
+    roll7_update_rate: float = 0.15,      # adds shape without runaway drift
+    roll30_update_rate: float = 0.05,     # very slow baseline drift
 ):
+    """
+    Recursive forecast that avoids the 'diminishing melt' while also avoiding a flat straight line.
+
+    Key ideas:
+    - Use *stateful* rolling features (roll7/roll30) updated with exponential smoothing (not raw mean of preds)
+    - Keep a *light* anchor blend (pred = (1-w)*pred_raw + w*anchor) so it stays stable but can move
+    - Cap day-to-day movement around yesterday's value (prevents explosions but keeps shape)
+    """
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
 
@@ -606,7 +619,9 @@ def generate_forecast_recursive(
     if hist.empty:
         return None
 
-    # Calendar
+    # -------------------------
+    # Calendar features
+    # -------------------------
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -616,26 +631,34 @@ def generate_forecast_recursive(
     fc["Is_Month_End"] = (fc["Day_of_Month"] >= 28).astype(int)
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
 
-    # Spend schedule: split by days + DOW pattern
+    # -------------------------
+    # Spend schedule (as your current logic)
+    # NOTE: this treats monthly_spend as "total for the selected window".
+    # We'll keep it unchanged here since you're focusing on diminishing first.
+    # -------------------------
     num_days = len(fc)
     daily_spend = float(monthly_spend) / num_days if num_days else 0.0
     dow_mult = _compute_spend_dow_multiplier(daily_data, product)
     fc["Spend"] = fc["Day_of_Week"].map(lambda d: dow_mult.get(int(d), 1.0)) * daily_spend
 
-    # Discounts
+    # -------------------------
+    # Discounts (baseline + overrides)
+    # -------------------------
     fc["Discount_Pct"] = float(baseline_target_discount)
     fc["Shopify_Discount"] = float(baseline_shopify_discount)
 
     for offer in shopify_offers:
-        offer_dates = pd.to_datetime(offer["dates"], errors="coerce")
-        fc.loc[fc["Date"].isin(offer_dates), "Shopify_Discount"] = float(offer["discount"])
+        offer_dates = pd.to_datetime(offer.get("dates", []), errors="coerce")
+        fc.loc[fc["Date"].isin(offer_dates), "Shopify_Discount"] = float(offer.get("discount", baseline_shopify_discount))
 
     for sale in target_sales:
-        sale_dates = pd.to_datetime(sale["dates"], errors="coerce")
-        fc.loc[fc["Date"].isin(sale_dates), "Discount_Pct"] = float(sale["discount"])
+        sale_dates = pd.to_datetime(sale.get("dates", []), errors="coerce")
+        fc.loc[fc["Date"].isin(sale_dates), "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
 
+    # -------------------------
     # Static values
-    avg_asp = float(hist["ASP"].mean()) if not pd.isna(hist["ASP"].mean()) else 0.0
+    # -------------------------
+    avg_asp = float(hist["ASP"].mean()) if ("ASP" in hist.columns and not pd.isna(hist["ASP"].mean())) else 0.0
     fc["ASP"] = avg_asp
 
     # Shopify proxies from history (SKU-only)
@@ -646,76 +669,101 @@ def generate_forecast_recursive(
     fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
     fc["Title_Encoded"] = int(title_to_code.get(product, 0))
 
-    # Cyclics
-    fc = pd.concat([
-        fc,
-        _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
-        _cyclic_encode(fc["Month"], 12, "mon"),
-        _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
-    ], axis=1)
+    # Cyclics (must match training)
+    fc = pd.concat(
+        [
+            fc,
+            _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
+            _cyclic_encode(fc["Month"], 12, "mon"),
+            _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
+        ],
+        axis=1,
+    )
 
     # -------------------------
-    # Recursive buffers (FIXED)
+    # Recursive state init
     # -------------------------
     hist_units = hist["Units_Sold"].tolist()
+    if not hist_units:
+        return None
 
-    # Stable reference levels from actual history only (prevents drift)
-    roll7_ref = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
-    roll30_ref = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
+    # Seed stable states from actual history
+    roll7 = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
+    roll30 = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
 
-    # Anchor starts from actual recent mean and moves slowly (much less mean-reversion)
-    anchor = roll7_ref
+    anchor = roll7  # baseline level reference
 
-    prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if "Spend_Adstock" in hist.columns and len(hist) else 0.0
+    # Adstock seed from history (if present)
+    prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if ("Spend_Adstock" in hist.columns and len(hist)) else 0.0
 
     preds, logs = [], []
     cap = float(max_daily_change_pct)
 
+    # Guard weights
+    aw = float(np.clip(anchor_weight, 0.0, 0.5))
+    au = float(np.clip(anchor_update_rate, 0.0, 0.5))
+    r7u = float(np.clip(roll7_update_rate, 0.0, 0.5))
+    r30u = float(np.clip(roll30_update_rate, 0.0, 0.5))
+
     for i in range(len(fc)):
-        # update adstock
+        # -------------------------
+        # Update adstock state
+        # -------------------------
         prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = float(np.log1p(prev_adstock))
 
-        # lags from evolving series (ok)
-        fc.loc[i, "Units_Lag_1"] = float(hist_units[-1]) if len(hist_units) >= 1 else 0.0
-        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else float(hist_units[-1]) if len(hist_units) else 0.0
+        # -------------------------
+        # Lags from evolving series
+        # -------------------------
+        lag1 = float(hist_units[-1]) if len(hist_units) else 0.0
+        lag7 = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
 
-        # ✅ freeze rolling stats to history-only references (no self-feeding drift)
-        fc.loc[i, "Units_Rolling_7"] = roll7_ref
-        fc.loc[i, "Units_Rolling_30"] = roll30_ref
+        fc.loc[i, "Units_Lag_1"] = lag1
+        fc.loc[i, "Units_Lag_7"] = lag7
 
-        # cross-channel gap
+        # ✅ Stateful rollings (adds shape, avoids runaway drift)
+        fc.loc[i, "Units_Rolling_7"] = roll7
+        fc.loc[i, "Units_Rolling_30"] = roll30
+
+        # Cross-channel gap
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
 
-        # predict
+        # -------------------------
+        # Predict
+        # -------------------------
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_log = float(units_model.predict(X_i)[0])
         pred_raw = max(float(np.expm1(pred_log)), 0.0)
 
-        # ✅ softer anchor blend (less pull-down)
-        pred = 0.90 * pred_raw + 0.10 * anchor
+        # ✅ Light anchor blend (stability without forced decay)
+        pred = (1.0 - aw) * pred_raw + aw * anchor
 
-        # ✅ cap relative to stable reference (prevents random-walk down)
-        ref = roll7_ref if roll7_ref > 0 else (float(hist_units[-1]) if len(hist_units) else pred)
-        if ref > 0:
-            pred = float(np.clip(pred, ref * (1.0 - cap), ref * (1.0 + cap)))
+        # ✅ Cap around yesterday to prevent explosions but keep variation
+        prev_u = lag1 if lag1 > 0 else pred
+        if prev_u > 0:
+            pred = float(np.clip(pred, prev_u * (1.0 - cap), prev_u * (1.0 + cap)))
 
         pred = max(pred, 0.0)
 
         preds.append(pred)
         logs.append(pred_log)
 
+        # -------------------------
+        # Update states (slowly)
+        # -------------------------
         hist_units.append(pred)
 
-        # ✅ anchor moves very slowly (optional; keeps smoothness)
-        anchor = 0.98 * anchor + 0.02 * pred
+        roll7 = (1.0 - r7u) * roll7 + r7u * pred
+        roll30 = (1.0 - r30u) * roll30 + r30u * pred
+        anchor = (1.0 - au) * anchor + au * pred
 
     fc["Predicted_Units"] = np.array(preds, dtype=float)
     fc["Predicted_Log_Units"] = np.array(logs, dtype=float)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
 
     return fc
+
 
 
 
@@ -1133,6 +1181,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
