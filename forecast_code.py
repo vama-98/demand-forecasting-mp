@@ -685,38 +685,37 @@ def generate_forecast_recursive(
     title_to_code: dict,
     adstock_alpha: float = ADSTOCK_ALPHA_DEFAULT,
     max_daily_change_pct: float = 0.20,
-    # ---- stability knobs ----
-    drift_floor_pct: float = 0.08,          # prevents melt (floor at 92% of last7 actual mean)
-    baseline_pull: float = 0.06,            # prevents runaway growth (pull to baseline)
-    anchor_weight: float = 0.10,
-    anchor_update_rate: float = 0.02,
-    roll7_update_rate: float = 0.14,
-    roll30_update_rate: float = 0.04,
-    # ---- anchored rollings (NEW: prevents rollings dominating recursion) ----
-    rolling_anchor_mix7: float = 0.35,      # higher => roll7 stays closer to last7 actual
-    rolling_anchor_mix30: float = 0.20,     # higher => roll30 stays closer to last7 actual
-    # ---- baseline wiggle (only when no events) ----
-    enable_baseline_wiggle: bool = True,
-    wiggle_strength: float = 0.15,
-    # ---- spend level impact (NEW: recurrent spend matters) ----
-    spend_level_effect: bool = True,
-    spend_elasticity_days: int = 120,
-    spend_elasticity_fallback: float = 0.15,
-    spend_ratio_clip: tuple = (0.30, 3.00),
-    # ---- optional: pass forecasted Shopify units when forecasting non-Shopify channels ----
     shopify_units_override: pd.Series | None = None,
 ):
+    """
+    Simplified recursive forecasting with better stability.
+    
+    Key improvements:
+    - Reduced from 15+ parameters to 3 core stabilizers
+    - Clearer logic flow with explicit damping
+    - Better handling of edge cases
+    - Proper spend elasticity integration
+    """
+    
+    # =========================================================================
+    # 1. SETUP & VALIDATION
+    # =========================================================================
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
-
+    
     hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == channel)].copy()
     hist = hist.sort_values("Order_date")
+    
     if hist.empty:
+        st.error(f"No historical data for {product} + {channel}")
         return None
-
-    # -------------------------
-    # Calendar
-    # -------------------------
+    
+    if len(hist) < 14:
+        st.warning(f"Only {len(hist)} days of history - forecast may be unreliable")
+    
+    # =========================================================================
+    # 2. CALENDAR FEATURES (same as before)
+    # =========================================================================
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -725,196 +724,198 @@ def generate_forecast_recursive(
     fc["Is_Month_Start"] = (fc["Day_of_Month"] <= 3).astype(int)
     fc["Is_Month_End"] = (fc["Day_of_Month"] >= 28).astype(int)
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
-
-    # -------------------------
-    # Spend schedule (your current interpretation: monthly_spend spread across selected window)
-    # -------------------------
+    
+    # =========================================================================
+    # 3. SPEND SCHEDULE
+    # =========================================================================
     num_days = len(fc)
     daily_spend = float(monthly_spend) / num_days if num_days else 0.0
     dow_mult = _compute_spend_dow_multiplier(daily_data, product)
     fc["Spend"] = fc["Day_of_Week"].map(lambda d: dow_mult.get(int(d), 1.0)) * daily_spend
-
-    # -------------------------
-    # Discounts
-    # -------------------------
+    
+    # =========================================================================
+    # 4. DISCOUNTS (events overlay)
+    # =========================================================================
     fc["Discount_Pct"] = float(baseline_target_discount)
     fc["Shopify_Discount"] = float(baseline_shopify_discount)
-
+    
+    # Apply Shopify offers
     for offer in shopify_offers:
         offer_dates = pd.to_datetime(offer.get("dates", []), errors="coerce")
         fc.loc[fc["Date"].isin(offer_dates), "Shopify_Discount"] = float(
             offer.get("discount", baseline_shopify_discount)
         )
-
+    
+    # Apply target channel sales
     for sale in target_sales:
         sale_dates = pd.to_datetime(sale.get("dates", []), errors="coerce")
         fc.loc[fc["Date"].isin(sale_dates), "Discount_Pct"] = float(
             sale.get("discount", baseline_target_discount)
         )
-
-    # -------------------------
-    # Static values
-    # -------------------------
+    
+    # =========================================================================
+    # 5. STATIC FEATURES
+    # =========================================================================
     avg_asp = float(hist["ASP"].mean()) if ("ASP" in hist.columns and not pd.isna(hist["ASP"].mean())) else 0.0
     fc["ASP"] = avg_asp
-
-    # Shopify units proxy (prefer override if provided)
+    
+    # Shopify units proxy
     if shopify_units_override is not None and len(shopify_units_override) == len(fc):
         fc["Shopify_Units"] = shopify_units_override.values.astype(float)
     else:
         shop_hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == "Shopify")]
         fc["Shopify_Units"] = float(shop_hist["Units_Sold"].mean()) if not shop_hist.empty else 0.0
-
+    
     # Encodings
     fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
     fc["Title_Encoded"] = int(title_to_code.get(product, 0))
-
-    # Cyclics (match training)
-    fc = pd.concat(
-        [
-            fc,
-            _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
-            _cyclic_encode(fc["Month"], 12, "mon"),
-            _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
-        ],
-        axis=1,
-    )
-
-    # -------------------------
-    # Baseline-only weekday wiggle (optional)
-    # -------------------------
-    has_any_events = (len(shopify_offers) > 0) or (len(target_sales) > 0)
-    units_dow_mult = (
-        _compute_units_dow_multiplier(daily_data, product, channel)
-        if (enable_baseline_wiggle and not has_any_events)
-        else None
-    )
-    wiggle_strength = float(np.clip(wiggle_strength, 0.0, 0.35))
-
-    # -------------------------
-    # Recursive state init
-    # -------------------------
+    
+    # Cyclic encodings
+    fc = pd.concat([
+        fc,
+        _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
+        _cyclic_encode(fc["Month"], 12, "mon"),
+        _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
+    ], axis=1)
+    
+    # =========================================================================
+    # 6. INITIALIZE RECURSIVE STATE
+    # =========================================================================
     hist_units = hist["Units_Sold"].tolist()
-    if not hist_units:
-        return None
-
-    last7_mean = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
-    last30_mean = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
-
-    baseline_level = max(last7_mean, 0.0)
-    floor_level = max(0.0, (1.0 - float(drift_floor_pct)) * baseline_level)
-
-    roll7 = last7_mean
-    roll30 = last30_mean
-    anchor = baseline_level
-
+    
+    # Compute stable baseline from recent history
+    recent_window = min(30, len(hist_units))
+    baseline_level = float(np.median(hist_units[-recent_window:])) if hist_units else 1.0
+    baseline_level = max(baseline_level, 1.0)  # floor at 1 unit
+    
+    # Initialize rolling windows
+    roll7 = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else baseline_level
+    roll30 = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else baseline_level
+    
+    # Initialize adstock
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if ("Spend_Adstock" in hist.columns and len(hist)) else 0.0
-
-    # Spend level effect (ratio vs last 30d observed for this SKU×channel)
-    if spend_level_effect:
-        hist_spend_30 = hist["Spend"].tail(30) if "Spend" in hist.columns else pd.Series(dtype=float)
-        hist_daily_spend = float(hist_spend_30.mean()) if len(hist_spend_30) else 0.0
-        planned_daily_spend = float(fc["Spend"].mean()) if len(fc) else 0.0
-
-        spend_ratio = planned_daily_spend / max(hist_daily_spend, 1.0)
-        spend_ratio = float(np.clip(spend_ratio, float(spend_ratio_clip[0]), float(spend_ratio_clip[1])))
-
-        spend_elasticity = estimate_spend_elasticity(
-            daily_data=daily_data,
-            product=product,
-            channel=channel,
-            days=int(spend_elasticity_days),
-            fallback=float(spend_elasticity_fallback),
-        )
-    else:
-        spend_ratio = 1.0
-        spend_elasticity = 0.0
-
+    
+    # =========================================================================
+    # 7. COMPUTE SPEND ELASTICITY (for incremental spend adjustment)
+    # =========================================================================
+    spend_elasticity = estimate_spend_elasticity(
+        daily_data=daily_data,
+        product=product,
+        channel=channel,
+        days=120,
+        fallback=0.15,
+    )
+    
+    # Historical vs planned spend ratio (for level-shift adjustment)
+    hist_spend_30 = hist["Spend"].tail(30) if "Spend" in hist.columns else pd.Series(dtype=float)
+    hist_daily_spend = float(hist_spend_30.mean()) if len(hist_spend_30) else 1.0
+    planned_daily_spend = float(fc["Spend"].mean()) if len(fc) else hist_daily_spend
+    spend_ratio = planned_daily_spend / max(hist_daily_spend, 1.0)
+    spend_ratio = float(np.clip(spend_ratio, 0.5, 2.0))  # reasonable bounds
+    
+    # =========================================================================
+    # 8. STABILIZATION PARAMETERS (simplified to 3 core knobs)
+    # =========================================================================
+    # Damping: prevents day-to-day explosions
+    damping = 0.70  # higher = smoother (0.5-0.9 recommended)
+    
+    # Mean reversion: pulls toward baseline (prevents long-term drift)
+    reversion_strength = 0.08  # higher = stronger pull to baseline (0.05-0.15 recommended)
+    
+    # Cap on daily % change (hard limit for safety)
+    cap = float(np.clip(max_daily_change_pct, 0.10, 0.40))
+    
+    # =========================================================================
+    # 9. RECURSIVE LOOP
+    # =========================================================================
     preds, logs = [], []
-    cap = float(max_daily_change_pct)
-
-    # clamp knobs
-    aw = float(np.clip(anchor_weight, 0.0, 0.5))
-    au = float(np.clip(anchor_update_rate, 0.0, 0.5))
-    r7u = float(np.clip(roll7_update_rate, 0.0, 0.5))
-    r30u = float(np.clip(roll30_update_rate, 0.0, 0.5))
-    baseline_pull = float(np.clip(baseline_pull, 0.0, 0.25))
-    mix7 = float(np.clip(rolling_anchor_mix7, 0.0, 0.95))
-    mix30 = float(np.clip(rolling_anchor_mix30, 0.0, 0.95))
-
+    
     for i in range(len(fc)):
-        # adstock update
+        # ---------------------------------------------------------------------
+        # Update adstock
+        # ---------------------------------------------------------------------
         prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = float(np.log1p(prev_adstock))
-
-        # lags
-        lag1 = float(hist_units[-1]) if len(hist_units) else 0.0
+        
+        # ---------------------------------------------------------------------
+        # Compute lags from history buffer
+        # ---------------------------------------------------------------------
+        lag1 = float(hist_units[-1]) if hist_units else baseline_level
         lag7 = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
+        
         fc.loc[i, "Units_Lag_1"] = lag1
         fc.loc[i, "Units_Lag_7"] = lag7
-
-        # anchored rollings (key change: rollings don't drift freely)
         fc.loc[i, "Units_Rolling_7"] = roll7
         fc.loc[i, "Units_Rolling_30"] = roll30
-
-        # gap
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
-
-        # predict
+        
+        # ---------------------------------------------------------------------
+        # Get raw model prediction
+        # ---------------------------------------------------------------------
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_log = float(units_model.predict(X_i)[0])
         pred_raw = max(float(np.expm1(pred_log)), 0.0)
-
-        # light anchor blend
-        pred = (1.0 - aw) * pred_raw + aw * anchor
-
-        # cap day-to-day around yesterday
-        prev_u = lag1 if lag1 > 0 else pred
-        if prev_u > 0:
-            pred = float(np.clip(pred, prev_u * (1.0 - cap), prev_u * (1.0 + cap)))
-
-        # baseline mean reversion (prevents runaway growth)
-        if baseline_level > 0 and baseline_pull > 0:
-            pred = (1.0 - baseline_pull) * pred + baseline_pull * baseline_level
-
-        # soft floor (prevents melting)
-        if baseline_level > 0:
-            pred = max(pred, floor_level)
-
-        # baseline-only weekday wiggle
-        if units_dow_mult is not None:
-            m = float(units_dow_mult.get(int(fc.loc[i, "Day_of_Week"]), 1.0))
-            pred *= (1.0 - wiggle_strength) + wiggle_strength * m
-
-        # spend level impact (apply AFTER stabilizers so it isn't neutralized)
-        if spend_level_effect and spend_ratio != 1.0:
-            pred *= (spend_ratio ** spend_elasticity)
-
+        
+        # ---------------------------------------------------------------------
+        # STABILIZER 1: Exponential smoothing (damping)
+        # Blend raw prediction with yesterday's actual
+        # ---------------------------------------------------------------------
+        pred = damping * lag1 + (1.0 - damping) * pred_raw
+        
+        # ---------------------------------------------------------------------
+        # STABILIZER 2: Mean reversion to baseline
+        # Prevents cumulative drift over long horizons
+        # ---------------------------------------------------------------------
+        pred = (1.0 - reversion_strength) * pred + reversion_strength * baseline_level
+        
+        # ---------------------------------------------------------------------
+        # STABILIZER 3: Daily change cap (hard limit)
+        # Prevents single-day explosions from promotions
+        # ---------------------------------------------------------------------
+        if lag1 > 0:
+            pred = float(np.clip(pred, lag1 * (1.0 - cap), lag1 * (1.0 + cap)))
+        
+        # ---------------------------------------------------------------------
+        # Apply spend level adjustment (if spend significantly changed)
+        # Only applies if spend_ratio != 1.0
+        # ---------------------------------------------------------------------
+        if abs(spend_ratio - 1.0) > 0.1:  # only adjust if >10% spend change
+            spend_multiplier = spend_ratio ** spend_elasticity
+            pred *= spend_multiplier
+        
+        # ---------------------------------------------------------------------
+        # Safety floor
+        # ---------------------------------------------------------------------
         pred = max(pred, 0.0)
-
+        
+        # ---------------------------------------------------------------------
+        # Store prediction
+        # ---------------------------------------------------------------------
         preds.append(pred)
-        logs.append(pred_log)
-
-        # update buffers/states
+        logs.append(np.log1p(pred))
+        
+        # ---------------------------------------------------------------------
+        # Update state for next iteration
+        # ---------------------------------------------------------------------
         hist_units.append(pred)
-
-        # smooth rollings, then re-anchor towards baseline_level (prevents rolling drift dominating recursion)
-        roll7 = (1.0 - r7u) * roll7 + r7u * pred
-        roll30 = (1.0 - r30u) * roll30 + r30u * pred
-        roll7 = (1.0 - mix7) * roll7 + mix7 * baseline_level
-        roll30 = (1.0 - mix30) * roll30 + mix30 * baseline_level
-
-        anchor = (1.0 - au) * anchor + au * pred
-
+        
+        # Update rolling windows with exponential smoothing (prevents them from drifting)
+        roll7 = 0.85 * roll7 + 0.15 * pred
+        roll30 = 0.95 * roll30 + 0.05 * pred
+    
+    # =========================================================================
+    # 10. FINALIZE FORECAST
+    # =========================================================================
     fc["Predicted_Units"] = np.array(preds, dtype=float)
     fc["Predicted_Log_Units"] = np.array(logs, dtype=float)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
-
-    # Optional debug columns (comment out if you don't want them)
-    fc["Spend_Ratio_vs_30D"] = float(spend_ratio)
+    
+    # Optional: add diagnostics
+    fc["Spend_Ratio_vs_Hist"] = float(spend_ratio)
     fc["Spend_Elasticity"] = float(spend_elasticity)
-
+    fc["Baseline_Level"] = float(baseline_level)
+    
     return fc
 # =============================================================================
 # PLOT
@@ -1339,6 +1340,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
