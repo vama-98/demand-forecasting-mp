@@ -588,7 +588,21 @@ def add_confidence_bands_logspace(df: pd.DataFrame, sigma_log: float, z: float =
 # =============================================================================
 # RECURSIVE FORECAST
 # =============================================================================
-
+def _compute_units_dow_multiplier(daily_data: pd.DataFrame, product: str, channel: str) -> dict:
+    d = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == channel)][
+        ["Order_date", "Units_Sold"]
+    ].copy()
+    if d.empty:
+        return {i: 1.0 for i in range(7)}
+    d["dow"] = d["Order_date"].dt.dayofweek
+    m = d.groupby("dow")["Units_Sold"].mean()
+    if m.empty or float(m.mean()) == 0.0:
+        return {i: 1.0 for i in range(7)}
+    m = m / float(m.mean())
+    out = {int(k): float(v) for k, v in m.to_dict().items()}
+    for i in range(7):
+        out.setdefault(i, 1.0)
+    return out
 def generate_forecast_recursive(
     product: str,
     channel: str,
@@ -606,20 +620,17 @@ def generate_forecast_recursive(
     title_to_code: dict,
     adstock_alpha: float = ADSTOCK_ALPHA_DEFAULT,
     max_daily_change_pct: float = 0.20,
-    # --- Anti-drift controls ---
-    drift_floor_pct: float = 0.12,   # floor at (1 - pct) * last7_actual_mean
-    ref_mix: float = 0.65,           # 0..1 mix between yesterday and stable ref for clipping
-    anchor_weight: float = 0.12,     # small stabilizer towards baseline level
-    anchor_update_rate: float = 0.02,# slow anchor drift
-    roll7_update_rate: float = 0.18, # give shape, but not too reactive
-    roll30_update_rate: float = 0.05 # very slow
+    # --- stability / realism knobs ---
+    drift_floor_pct: float = 0.08,      # floor at 92% of last7 actual mean (prevents melting)
+    baseline_pull: float = 0.06,        # pull pred back to baseline level (prevents runaway growth)
+    anchor_weight: float = 0.10,        # small stabilizer towards baseline
+    anchor_update_rate: float = 0.02,   # slow anchor drift
+    roll7_update_rate: float = 0.14,    # adds shape without drift
+    roll30_update_rate: float = 0.04,   # very slow
+    # baseline wiggle
+    enable_baseline_wiggle: bool = True,
+    wiggle_strength: float = 0.15,      # 0.10–0.20 is safe
 ):
-    """
-    Recursive forecast with anti-drift guard:
-    - Uses smoothed rolling states (roll7/roll30) for shape
-    - Clips day-to-day movement around a blended reference (yesterday + stable baseline)
-    - Applies a soft floor around last-7-day actual mean to prevent melt when drivers are flat
-    """
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
 
@@ -628,9 +639,7 @@ def generate_forecast_recursive(
     if hist.empty:
         return None
 
-    # -------------------------
-    # Calendar features
-    # -------------------------
+    # Calendar
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -640,17 +649,13 @@ def generate_forecast_recursive(
     fc["Is_Month_End"] = (fc["Day_of_Month"] >= 28).astype(int)
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
 
-    # -------------------------
-    # Spend schedule (keeping your current interpretation)
-    # -------------------------
+    # Spend schedule (keeping your current logic)
     num_days = len(fc)
     daily_spend = float(monthly_spend) / num_days if num_days else 0.0
     dow_mult = _compute_spend_dow_multiplier(daily_data, product)
     fc["Spend"] = fc["Day_of_Week"].map(lambda d: dow_mult.get(int(d), 1.0)) * daily_spend
 
-    # -------------------------
-    # Discounts (baseline + overrides)
-    # -------------------------
+    # Discounts
     fc["Discount_Pct"] = float(baseline_target_discount)
     fc["Shopify_Discount"] = float(baseline_shopify_discount)
 
@@ -662,13 +667,11 @@ def generate_forecast_recursive(
         sale_dates = pd.to_datetime(sale.get("dates", []), errors="coerce")
         fc.loc[fc["Date"].isin(sale_dates), "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
 
-    # -------------------------
     # Static values
-    # -------------------------
     avg_asp = float(hist["ASP"].mean()) if ("ASP" in hist.columns and not pd.isna(hist["ASP"].mean())) else 0.0
     fc["ASP"] = avg_asp
 
-    # Shopify proxies from history (SKU-only)
+    # Shopify proxy units
     shop_hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == "Shopify")]
     fc["Shopify_Units"] = float(shop_hist["Units_Sold"].mean()) if not shop_hist.empty else 0.0
 
@@ -676,20 +679,20 @@ def generate_forecast_recursive(
     fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
     fc["Title_Encoded"] = int(title_to_code.get(product, 0))
 
-    # Cyclics (must match training)
-    fc = pd.concat(
-        [
-            fc,
-            _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
-            _cyclic_encode(fc["Month"], 12, "mon"),
-            _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
-        ],
-        axis=1,
-    )
+    # Cyclics (match training)
+    fc = pd.concat([
+        fc,
+        _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
+        _cyclic_encode(fc["Month"], 12, "mon"),
+        _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
+    ], axis=1)
 
-    # -------------------------
+    # Baseline-only wiggle multipliers (computed from actual history)
+    has_any_events = (len(shopify_offers) > 0) or (len(target_sales) > 0)
+    units_dow_mult = _compute_units_dow_multiplier(daily_data, product, channel) if (enable_baseline_wiggle and not has_any_events) else None
+    wiggle_strength = float(np.clip(wiggle_strength, 0.0, 0.35))
+
     # Recursive state init
-    # -------------------------
     hist_units = hist["Units_Sold"].tolist()
     if not hist_units:
         return None
@@ -697,29 +700,24 @@ def generate_forecast_recursive(
     last7_mean = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else float(np.mean(hist_units))
     last30_mean = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else float(np.mean(hist_units))
 
-    # stable baseline reference level from ACTUAL history
     baseline_level = max(last7_mean, 0.0)
     floor_level = max(0.0, (1.0 - float(drift_floor_pct)) * baseline_level)
 
-    # smoothed rolling states (start from actual)
     roll7 = last7_mean
     roll30 = last30_mean
-
-    # anchor is a slow-moving baseline
     anchor = baseline_level
 
-    # adstock seed
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if ("Spend_Adstock" in hist.columns and len(hist)) else 0.0
 
     preds, logs = [], []
     cap = float(max_daily_change_pct)
 
     # clamp knobs
-    ref_mix = float(np.clip(ref_mix, 0.0, 1.0))
     aw = float(np.clip(anchor_weight, 0.0, 0.5))
     au = float(np.clip(anchor_update_rate, 0.0, 0.5))
     r7u = float(np.clip(roll7_update_rate, 0.0, 0.5))
     r30u = float(np.clip(roll30_update_rate, 0.0, 0.5))
+    baseline_pull = float(np.clip(baseline_pull, 0.0, 0.25))
 
     for i in range(len(fc)):
         # adstock update
@@ -745,36 +743,34 @@ def generate_forecast_recursive(
         pred_log = float(units_model.predict(X_i)[0])
         pred_raw = max(float(np.expm1(pred_log)), 0.0)
 
-        # light anchor blend (keeps stability)
+        # light anchor blend
         pred = (1.0 - aw) * pred_raw + aw * anchor
 
-        # -------------------------
-        # Anti-drift clipping
-        # -------------------------
-        # stable reference is baseline + roll7 (both from slowly moving state)
-        stable_ref = 0.7 * baseline_level + 0.3 * roll7
-        stable_ref = max(stable_ref, 0.0)
+        # cap day-to-day around yesterday
+        prev_u = lag1 if lag1 > 0 else pred
+        if prev_u > 0:
+            pred = float(np.clip(pred, prev_u * (1.0 - cap), prev_u * (1.0 + cap)))
 
-        # blend yesterday with stable_ref so we keep variation without random-walk down
-        ref = ref_mix * lag1 + (1.0 - ref_mix) * stable_ref
-        ref = ref if ref > 0 else (stable_ref if stable_ref > 0 else pred)
+        # baseline mean reversion (prevents runaway growth)
+        if baseline_level > 0 and baseline_pull > 0:
+            pred = (1.0 - baseline_pull) * pred + baseline_pull * baseline_level
 
-        if ref > 0:
-            pred = float(np.clip(pred, ref * (1.0 - cap), ref * (1.0 + cap)))
-
-        # soft floor around actual baseline level (prevents “melt” when drivers are flat)
+        # soft floor (prevents melting)
         if baseline_level > 0:
             pred = max(pred, floor_level)
+
+        # baseline-only weekday wiggle (small; keeps it from being a dead straight line)
+        if units_dow_mult is not None:
+            m = float(units_dow_mult.get(int(fc.loc[i, "Day_of_Week"]), 1.0))
+            pred *= (1.0 - wiggle_strength) + wiggle_strength * m
 
         pred = max(pred, 0.0)
 
         preds.append(pred)
         logs.append(pred_log)
 
-        # update buffers
+        # update buffers/states
         hist_units.append(pred)
-
-        # update states slowly (shape, but no chase)
         roll7 = (1.0 - r7u) * roll7 + r7u * pred
         roll30 = (1.0 - r30u) * roll30 + r30u * pred
         anchor = (1.0 - au) * anchor + au * pred
@@ -784,8 +780,6 @@ def generate_forecast_recursive(
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
 
     return fc
-
-
 # =============================================================================
 # PLOT
 # =============================================================================
@@ -1199,6 +1193,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
