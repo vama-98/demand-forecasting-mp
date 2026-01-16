@@ -228,25 +228,34 @@ def estimate_spend_elasticity(
 
     return float(np.clip(e, 0.05, 0.30))
 
-def show_feature_importance(units_model, feature_cols, top_n=30):
+def show_feature_importance(units_model, feature_cols, top_n=40):
     import pandas as pd
 
     booster = units_model.get_booster()
+    score = booster.get_score(importance_type="gain")  # dict: {feature_name: gain}
 
-    # Gain-based importance (best for interpretation)
-    score = booster.get_score(importance_type="gain")
-
-    # Map f0, f1, ... to feature names
-    imp = []
+    rows = []
     for k, v in score.items():
-        idx = int(k.replace("f", ""))
-        if idx < len(feature_cols):
-            imp.append((feature_cols[idx], v))
+        # Case 1: keys look like "f12"
+        if isinstance(k, str) and k.startswith("f") and k[1:].isdigit():
+            idx = int(k[1:])
+            name = feature_cols[idx] if idx < len(feature_cols) else k
+        else:
+            # Case 2: keys are already feature names
+            name = k
+        rows.append((name, float(v)))
 
-    imp_df = pd.DataFrame(imp, columns=["Feature", "Gain"])
-    imp_df = imp_df.sort_values("Gain", ascending=False)
+    imp_df = pd.DataFrame(rows, columns=["Feature", "Gain"]).sort_values("Gain", ascending=False)
 
-    return imp_df.head(top_n)
+    # Ensure Shopify features show up even if missing
+    for f in ["Shopify_Discount", "Shopify_Units", "Discount_Gap"]:
+        if f not in imp_df["Feature"].values:
+            imp_df = pd.concat([imp_df, pd.DataFrame([[f, 0.0]], columns=["Feature", "Gain"])], ignore_index=True)
+
+    # Aggregate duplicates (sometimes both f-keys and names can map to same feature)
+    imp_df = imp_df.groupby("Feature", as_index=False)["Gain"].sum().sort_values("Gain", ascending=False)
+
+    return imp_df.head(top_n), imp_df
 
 
 def load_training_metrics(path: str = "training_metrics.json") -> dict | None:
@@ -1161,9 +1170,16 @@ def main():
             )
         if sale_dates:
             target_sales.append({"discount": float(sale_discount), "dates": sale_dates})
+
+    top_imp, full_imp = show_feature_importance(units_model, feature_cols, top_n=40)
+
     st.subheader("🔍 Model Feature Importance (Gain)")
-    imp_df = show_feature_importance(units_model, feature_cols, top_n=40)
-    st.dataframe(imp_df, use_container_width=True, height=500)
+    st.dataframe(top_imp, use_container_width=True, height=500)
+
+    st.subheader("🧾 Shopify Feature Importance (Gain)")
+    shop = full_imp[full_imp["Feature"].isin(["Shopify_Discount", "Shopify_Units", "Discount_Gap"])]
+    st.dataframe(shop, use_container_width=True)
+
     
     st.markdown("---")
     if st.button("🔮 Generate Forecast", type="primary", use_container_width=True):
@@ -1295,6 +1311,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
