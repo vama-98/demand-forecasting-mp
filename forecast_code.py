@@ -111,6 +111,15 @@ def load_data():
         spends_df.rename(columns={"Master_title": "Master_Title"}, inplace=True)
 
         offers_df = pd.read_excel(OFFERS_FILE)
+        offers_df.columns = (
+        offers_df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)   # remove BOM if present
+        .str.replace("\xa0", " ", regex=False)    # replace non-breaking spaces
+        .str.strip()
+        )
+
+st.write("Offers columns:", [repr(c) for c in offers_df.columns])  # debug once
+
         offers_df.columns = offers_df.columns.str.strip()
 
         # Remove Offline
@@ -1057,4 +1066,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
