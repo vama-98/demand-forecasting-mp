@@ -191,6 +191,43 @@ def load_data():
 # =============================================================================
 # HELPERS
 # =============================================================================
+def estimate_spend_elasticity(
+    daily_data: pd.DataFrame,
+    product: str,
+    channel: str,
+    days: int = 120,
+    fallback: float = 0.15,
+) -> float:
+    """
+    Estimate spend elasticity from recent history:
+      log(Units) ~ a + e * log(Spend_Adstock + 1)
+
+    Returns e clipped to a safe range.
+    """
+    d = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == channel)].copy()
+    if d.empty or ("Spend_Adstock" not in d.columns):
+        return float(fallback)
+
+    d = d.sort_values("Order_date")
+    cutoff = d["Order_date"].max() - pd.Timedelta(days=days)
+    d = d[d["Order_date"] >= cutoff]
+
+    d = d.dropna(subset=["Units_Sold", "Spend_Adstock"])
+    d = d[(d["Units_Sold"] > 0) & (d["Spend_Adstock"] >= 0)]
+
+    if len(d) < 45:
+        return float(fallback)
+
+    x = np.log1p(d["Spend_Adstock"].astype(float).values)
+    y = np.log(d["Units_Sold"].astype(float).values)
+
+    try:
+        e = float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        e = float(fallback)
+
+    return float(np.clip(e, 0.05, 0.30))
+
 def load_training_metrics(path: str = "training_metrics.json") -> dict | None:
     import json, os
     if not os.path.exists(path):
@@ -630,6 +667,10 @@ def generate_forecast_recursive(
     # baseline wiggle
     enable_baseline_wiggle: bool = True,
     wiggle_strength: float = 0.15,      # 0.10–0.20 is safe
+    # --- spend level impact (new) ---
+    spend_elasticity_days: int = 120,
+    spend_elasticity_fallback: float = 0.15,
+    spend_ratio_clip: tuple = (0.30, 3.00),
 ):
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
@@ -661,11 +702,15 @@ def generate_forecast_recursive(
 
     for offer in shopify_offers:
         offer_dates = pd.to_datetime(offer.get("dates", []), errors="coerce")
-        fc.loc[fc["Date"].isin(offer_dates), "Shopify_Discount"] = float(offer.get("discount", baseline_shopify_discount))
+        fc.loc[fc["Date"].isin(offer_dates), "Shopify_Discount"] = float(
+            offer.get("discount", baseline_shopify_discount)
+        )
 
     for sale in target_sales:
         sale_dates = pd.to_datetime(sale.get("dates", []), errors="coerce")
-        fc.loc[fc["Date"].isin(sale_dates), "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
+        fc.loc[fc["Date"].isin(sale_dates), "Discount_Pct"] = float(
+            sale.get("discount", baseline_target_discount)
+        )
 
     # Static values
     avg_asp = float(hist["ASP"].mean()) if ("ASP" in hist.columns and not pd.isna(hist["ASP"].mean())) else 0.0
@@ -689,7 +734,11 @@ def generate_forecast_recursive(
 
     # Baseline-only wiggle multipliers (computed from actual history)
     has_any_events = (len(shopify_offers) > 0) or (len(target_sales) > 0)
-    units_dow_mult = _compute_units_dow_multiplier(daily_data, product, channel) if (enable_baseline_wiggle and not has_any_events) else None
+    units_dow_mult = (
+        _compute_units_dow_multiplier(daily_data, product, channel)
+        if (enable_baseline_wiggle and not has_any_events)
+        else None
+    )
     wiggle_strength = float(np.clip(wiggle_strength, 0.0, 0.35))
 
     # Recursive state init
@@ -708,6 +757,24 @@ def generate_forecast_recursive(
     anchor = baseline_level
 
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if ("Spend_Adstock" in hist.columns and len(hist)) else 0.0
+
+    # -------------------------
+    # NEW: Spend level impact (recurrent spend should matter)
+    # -------------------------
+    hist_spend_30 = hist["Spend"].tail(30) if "Spend" in hist.columns else pd.Series(dtype=float)
+    hist_daily_spend = float(hist_spend_30.mean()) if len(hist_spend_30) else 0.0
+    planned_daily_spend = float(fc["Spend"].mean()) if len(fc) else 0.0
+
+    spend_ratio = planned_daily_spend / max(hist_daily_spend, 1.0)
+    spend_ratio = float(np.clip(spend_ratio, float(spend_ratio_clip[0]), float(spend_ratio_clip[1])))
+
+    spend_elasticity = estimate_spend_elasticity(
+        daily_data=daily_data,
+        product=product,
+        channel=channel,
+        days=int(spend_elasticity_days),
+        fallback=float(spend_elasticity_fallback),
+    )
 
     preds, logs = [], []
     cap = float(max_daily_change_pct)
@@ -764,6 +831,11 @@ def generate_forecast_recursive(
             m = float(units_dow_mult.get(int(fc.loc[i, "Day_of_Week"]), 1.0))
             pred *= (1.0 - wiggle_strength) + wiggle_strength * m
 
+        # -------------------------
+        # NEW: Apply spend level effect AFTER stability so it isn't neutralized
+        # -------------------------
+        pred *= (spend_ratio ** spend_elasticity)
+
         pred = max(pred, 0.0)
 
         preds.append(pred)
@@ -778,6 +850,12 @@ def generate_forecast_recursive(
     fc["Predicted_Units"] = np.array(preds, dtype=float)
     fc["Predicted_Log_Units"] = np.array(logs, dtype=float)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
+
+    # (Optional) helpful debug columns for UI/table
+    fc["Planned_Daily_Spend"] = planned_daily_spend
+    fc["Hist_Daily_Spend_30D"] = hist_daily_spend
+    fc["Spend_Ratio_vs_30D"] = spend_ratio
+    fc["Spend_Elasticity"] = spend_elasticity
 
     return fc
 # =============================================================================
