@@ -1021,11 +1021,6 @@ def main():
         band_level = st.selectbox("Band level", ["90%", "95%"], index=0)
         z = 1.64 if band_level == "90%" else 1.96
 
-    st.subheader("🔍 Model Feature Importance (Gain)")
-
-    imp_df = show_feature_importance(units_model, feature_cols, top_n=40)
-    st.dataframe(imp_df, use_container_width=True, height=500)
-
     units_model, feature_cols, channel_to_code, title_to_code, sigma_units_log = load_models()
     if units_model is None:
         st.warning("⚠️ Please train the model from the sidebar.")
@@ -1166,7 +1161,10 @@ def main():
             )
         if sale_dates:
             target_sales.append({"discount": float(sale_discount), "dates": sale_dates})
-
+    st.subheader("🔍 Model Feature Importance (Gain)")
+    imp_df = show_feature_importance(units_model, feature_cols, top_n=40)
+    st.dataframe(imp_df, use_container_width=True, height=500)
+    
     st.markdown("---")
     if st.button("🔮 Generate Forecast", type="primary", use_container_width=True):
         with st.spinner("Generating forecasts..."):
@@ -1297,6 +1295,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
