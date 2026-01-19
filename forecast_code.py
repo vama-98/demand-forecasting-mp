@@ -1019,7 +1019,7 @@ def plot_history_vs_forecast(hist_plot, baseline_fc, scenario_fc, forecast_start
 # =============================================================================
 
 def main():
-    st.title("📊 Sales Forecasting Dashboard (v2)")
+    st.title("📊 Sales Forecasting Dashboard")
     st.markdown("---")
 
     sales_df, spends_df, offers_df = load_data()
@@ -1340,6 +1340,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
