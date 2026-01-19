@@ -1336,6 +1336,7 @@ def main():
                 title_to_code=title_to_code,
                 adstock_alpha=float(adstock_alpha),
                 max_daily_change_pct=float(max_daily_change_pct),
+                stabilization_mode="light",
             )
 
             baseline_fc = generate_forecast_recursive(
@@ -1355,6 +1356,7 @@ def main():
                 title_to_code=title_to_code,
                 adstock_alpha=float(adstock_alpha),
                 max_daily_change_pct=float(max_daily_change_pct),
+                stabilization_mode="medium",
             )
 
             if scenario_fc is None or baseline_fc is None:
@@ -1446,6 +1448,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
