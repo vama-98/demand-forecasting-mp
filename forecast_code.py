@@ -1179,7 +1179,7 @@ def main():
                     "dates": offer_dates
                 })
     else:
-        st.info("No offers available for this product in offer.xlsx")
+        st.info("No offers data available for this product")
 
     st.markdown("---")
 
@@ -1340,6 +1340,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
