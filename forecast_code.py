@@ -668,7 +668,7 @@ def _compute_units_dow_multiplier(daily_data: pd.DataFrame, product: str, channe
     for i in range(7):
         out.setdefault(i, 1.0)
     return out
-def generate_forecast_recursive_v2(
+def generate_forecast_recursive(
     product: str,
     channel: str,
     start_date,
@@ -1446,6 +1446,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
