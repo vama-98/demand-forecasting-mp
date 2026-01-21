@@ -685,30 +685,11 @@ def generate_forecast_recursive(
     title_to_code: dict,
     adstock_alpha: float = 0.30,
     max_daily_change_pct: float = 0.35,
-    stabilization_mode: str = "adaptive",  # "light", "medium", "heavy", "adaptive"
+    stabilization_mode: str = "adaptive", 
     shopify_units_override: pd.Series | None = None,
 ):
-    """
-    IMPROVED Recursive Forecasting - Less reliant on past, more responsive to events.
-    
-    Key improvements:
-    - Adaptive stabilization based on scenario type
-    - Event-aware forecasting (detects promotions)
-    - Reduced mean reversion
-    - Better spend elasticity handling
-    - Promotional lift modeling
-    
-    Parameters:
-    -----------
-    stabilization_mode : str
-        - "light": Minimal dampening (best for campaigns with big changes)
-        - "medium": Balanced (recommended for most scenarios)
-        - "heavy": Strong stabilization (conservative baseline forecasts)
-        - "adaptive": Auto-detects scenario and adjusts (RECOMMENDED)
-    """
-    
     # =========================================================================
-    # 1. SETUP & VALIDATION
+    # 1. SETUP & CALENDAR
     # =========================================================================
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
@@ -719,13 +700,7 @@ def generate_forecast_recursive(
     if hist.empty:
         st.error(f"No historical data for {product} + {channel}")
         return None
-    
-    if len(hist) < 14:
-        st.warning(f"Only {len(hist)} days of history - forecast may be unreliable")
-    
-    # =========================================================================
-    # 2. CALENDAR FEATURES
-    # =========================================================================
+
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -736,291 +711,136 @@ def generate_forecast_recursive(
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
     
     # =========================================================================
-    # 3. SPEND SCHEDULE
+    # 2. SPEND & DISCOUNTS
     # =========================================================================
     num_days = len(fc)
-    daily_spend = float(monthly_spend) / num_days if num_days else 0.0
+    daily_spend_base = float(monthly_spend) / num_days if num_days else 0.0
     dow_mult = _compute_spend_dow_multiplier(daily_data, product)
-    fc["Spend"] = fc["Day_of_Week"].map(lambda d: dow_mult.get(int(d), 1.0)) * daily_spend
+    fc["Spend"] = fc["Day_of_Week"].map(lambda d: dow_mult.get(int(d), 1.0)) * daily_spend_base
     
-    # =========================================================================
-    # 4. DISCOUNTS & EVENT DETECTION
-    # =========================================================================
     fc["Discount_Pct"] = float(baseline_target_discount)
     fc["Shopify_Discount"] = float(baseline_shopify_discount)
-    fc["Is_Promo_Event"] = 0  # Flag for promotional events
+    fc["Is_Promo_Event"] = 0
     
-    # Apply Shopify offers
     for offer in shopify_offers:
-        offer_dates = pd.to_datetime(offer.get("dates", []), errors="coerce")
-        mask = fc["Date"].isin(offer_dates)
+        mask = fc["Date"].isin(pd.to_datetime(offer.get("dates", [])))
         fc.loc[mask, "Shopify_Discount"] = float(offer.get("discount", baseline_shopify_discount))
-        if abs(float(offer.get("discount", baseline_shopify_discount)) - baseline_shopify_discount) > 5:
-            fc.loc[mask, "Is_Promo_Event"] = 1
+        fc.loc[mask, "Is_Promo_Event"] = 1
     
-    # Apply target channel sales
     for sale in target_sales:
-        sale_dates = pd.to_datetime(sale.get("dates", []), errors="coerce")
-        mask = fc["Date"].isin(sale_dates)
+        mask = fc["Date"].isin(pd.to_datetime(sale.get("dates", [])))
         fc.loc[mask, "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
-        if abs(float(sale.get("discount", baseline_target_discount)) - baseline_target_discount) > 5:
-            fc.loc[mask, "Is_Promo_Event"] = 1
-    
-    # Calculate discount lift (how much deeper than baseline)
+        fc.loc[mask, "Is_Promo_Event"] = 1
+
     fc["Discount_Lift"] = fc["Discount_Pct"] - baseline_target_discount
-    fc["Shopify_Lift"] = fc["Shopify_Discount"] - baseline_shopify_discount
     
     # =========================================================================
-    # 5. STATIC FEATURES
+    # 3. STATIC FEATURES & ELASTICITY
     # =========================================================================
-    avg_asp = float(hist["ASP"].mean()) if ("ASP" in hist.columns and not pd.isna(hist["ASP"].mean())) else 0.0
+    avg_asp = float(hist["ASP"].mean()) if "ASP" in hist.columns else 0.0
     fc["ASP"] = avg_asp
     
-    # Shopify units proxy
-    if shopify_units_override is not None and len(shopify_units_override) == len(fc):
-        fc["Shopify_Units"] = shopify_units_override.values.astype(float)
+    if shopify_units_override is not None:
+        fc["Shopify_Units"] = shopify_units_override.values
     else:
         shop_hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == "Shopify")]
         fc["Shopify_Units"] = float(shop_hist["Units_Sold"].mean()) if not shop_hist.empty else 0.0
-    
-    # Encodings
+
     fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
     fc["Title_Encoded"] = int(title_to_code.get(product, 0))
-    
-    # Cyclic encodings
-    fc = pd.concat([
-        fc,
-        _cyclic_encode(fc["Day_of_Week"], 7, "dow"),
-        _cyclic_encode(fc["Month"], 12, "mon"),
-        _cyclic_encode(fc["Week_of_Year"], 52, "woy"),
-    ], axis=1)
-    
+    fc = pd.concat([fc, _cyclic_encode(fc["Day_of_Week"], 7, "dow"), 
+                    _cyclic_encode(fc["Month"], 12, "mon"), 
+                    _cyclic_encode(fc["Week_of_Year"], 52, "woy")], axis=1)
+
+    # Elasticity Calculations
+    spend_elasticity = estimate_spend_elasticity(daily_data, product, channel)
+    hist_spend_recent = hist["Spend"].tail(60).median()
+    planned_spend_med = fc["Spend"].median()
+    spend_ratio = planned_spend_med / max(hist_spend_recent, 1.0)
+
+    # Promotional Lift Factor from history
+    promo_lift_factor = 1.0
+    hist_promo = hist[hist["Discount_Pct"] > baseline_target_discount + 10]
+    hist_norm = hist[hist["Discount_Pct"] <= baseline_target_discount + 5]
+    if not hist_promo.empty and not hist_norm.empty:
+        promo_lift_factor = np.clip(hist_promo["Units_Sold"].mean() / hist_norm["Units_Sold"].mean(), 1.0, 3.0)
+
     # =========================================================================
-    # 6. INITIALIZE RECURSIVE STATE
+    # 4. INITIALIZE RECURSIVE STATE
     # =========================================================================
     hist_units = hist["Units_Sold"].tolist()
+    baseline_level = max(float(hist["Units_Sold"].tail(30).median()), 1.0)
     
-    # Compute baseline from recent non-promotional days
-    recent_window = min(60, len(hist))
-    recent_data = hist.tail(recent_window)
-    
-    # Filter out extreme outliers for baseline calculation
-    q25, q75 = recent_data["Units_Sold"].quantile([0.25, 0.75])
-    iqr = q75 - q25
-    recent_normal = recent_data[
-        (recent_data["Units_Sold"] >= q25 - 1.5 * iqr) & 
-        (recent_data["Units_Sold"] <= q75 + 1.5 * iqr)
-    ]
-    
-    baseline_level = float(recent_normal["Units_Sold"].median()) if not recent_normal.empty else float(recent_data["Units_Sold"].median())
-    baseline_level = max(baseline_level, 1.0)
-    
-    # Initialize rolling windows
     roll7 = float(np.mean(hist_units[-7:])) if len(hist_units) >= 7 else baseline_level
     roll30 = float(np.mean(hist_units[-30:])) if len(hist_units) >= 30 else baseline_level
-    
-    # Initialize adstock
-    prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if ("Spend_Adstock" in hist.columns and len(hist)) else 0.0
-    
+    prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if "Spend_Adstock" in hist.columns else 0.0
+
     # =========================================================================
-    # 7. COMPUTE SPEND ELASTICITY & PROMOTIONAL LIFT
-    # =========================================================================
-    spend_elasticity = estimate_spend_elasticity(
-        daily_data=daily_data,
-        product=product,
-        channel=channel,
-        days=120,
-        fallback=0.20,  # Slightly higher default
-    )
-    
-    # Historical spend baseline
-    hist_spend_60 = hist["Spend"].tail(60) if "Spend" in hist.columns else pd.Series(dtype=float)
-    hist_daily_spend = float(hist_spend_60.median()) if len(hist_spend_60) else 1.0
-    planned_daily_spend = float(fc["Spend"].median()) if len(fc) else hist_daily_spend
-    spend_ratio = planned_daily_spend / max(hist_daily_spend, 1.0)
-    spend_ratio = float(np.clip(spend_ratio, 0.3, 3.0))  # Wider bounds
-    
-    # Estimate promotional lift from history
-    promo_lift_factor = 1.0
-    if "Discount_Pct" in hist.columns:
-        hist_with_discount = hist[hist["Discount_Pct"] > baseline_target_discount + 10].copy()
-        hist_normal = hist[hist["Discount_Pct"] <= baseline_target_discount + 5].copy()
-        
-        if not hist_with_discount.empty and not hist_normal.empty:
-            avg_promo_units = float(hist_with_discount["Units_Sold"].mean())
-            avg_normal_units = float(hist_normal["Units_Sold"].mean())
-            if avg_normal_units > 0:
-                promo_lift_factor = avg_promo_units / avg_normal_units
-                promo_lift_factor = float(np.clip(promo_lift_factor, 1.0, 3.0))
-    
-    # =========================================================================
-    # 8. ADAPTIVE STABILIZATION PARAMETERS
-    # =========================================================================
-    
-    # Detect scenario characteristics
-    has_big_discounts = (fc["Discount_Lift"].abs() > 10).any()
-    has_spend_change = abs(spend_ratio - 1.0) > 0.3
-    num_promo_days = (fc["Is_Promo_Event"] == 1).sum()
-    is_campaign = has_big_discounts or (has_spend_change and num_promo_days > 0)
-    
-    # Set stabilization based on mode
-    if stabilization_mode == "adaptive":
-        if is_campaign:
-            mode = "light"
-            st.info(f"🚀 Campaign detected ({num_promo_days} promo days) - Using LIGHT stabilization")
-        else:
-            mode = "medium"
-            st.info("📊 Standard forecast - Using MEDIUM stabilization")
-    else:
-        mode = stabilization_mode
-    
-    # Stabilization presets
-    if mode == "light":
-        damping = 0.25              # 75% weight to model prediction
-        reversion_strength = 0.01   # Very weak pull to baseline
-        cap = 0.50                  # ±50% daily change allowed
-        rolling_update_rate = 0.30  # Faster adaptation
-    elif mode == "medium":
-        damping = 0.50              # Balanced
-        reversion_strength = 0.03   # Moderate pull
-        cap = 0.35                  # ±35% daily change
-        rolling_update_rate = 0.20
-    else:  # heavy
-        damping = 0.75              # Conservative
-        reversion_strength = 0.08   # Strong pull to baseline
-        cap = 0.20                  # ±20% daily change
-        rolling_update_rate = 0.10
-    
-    # Override cap with user setting if provided
-    if max_daily_change_pct:
-        cap = float(np.clip(max_daily_change_pct, 0.10, 0.80))
-    
-    # =========================================================================
-    # 9. RECURSIVE LOOP (IMPROVED)
+    # 5. RECURSIVE LOOP (FIXED)
     # =========================================================================
     preds, logs = [], []
     
     for i in range(len(fc)):
-        # ---------------------------------------------------------------------
-        # Update adstock
-        # ---------------------------------------------------------------------
+        # Update Adstock
         prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
         fc.loc[i, "Spend_Adstock"] = prev_adstock
-        fc.loc[i, "Spend_Sat"] = float(np.log1p(prev_adstock))
+        fc.loc[i, "Spend_Sat"] = np.log1p(prev_adstock)
         
-        # ---------------------------------------------------------------------
-        # Compute lags from history buffer
-        # ---------------------------------------------------------------------
-        lag1 = float(hist_units[-1]) if hist_units else baseline_level
-        lag7 = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
-        
+        # Set Lag Features for this step
+        lag1 = float(hist_units[-1])
         fc.loc[i, "Units_Lag_1"] = lag1
-        fc.loc[i, "Units_Lag_7"] = lag7
+        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
         fc.loc[i, "Units_Rolling_7"] = roll7
         fc.loc[i, "Units_Rolling_30"] = roll30
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
         
-        # ---------------------------------------------------------------------
-        # Get raw model prediction
-        # ---------------------------------------------------------------------
+        # Raw Model Prediction
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_log = float(units_model.predict(X_i)[0])
         pred_raw = max(float(np.expm1(pred_log)), 0.0)
-        
-        # ---------------------------------------------------------------------
-        # IMPROVED STABILIZER 1: Context-aware damping
-        # On promo days, trust the model more
-        # ---------------------------------------------------------------------
+
+        # Apply Contextual Multipliers (Non-Compounding)
         is_promo_day = fc.loc[i, "Is_Promo_Event"] == 1
         
-        if is_promo_day:
-            # Reduce damping on promo days (trust model more)
-            effective_damping = damping * 0.5
-        else:
-            effective_damping = damping
+        # Spend multiplier applied to raw prediction
+        eff_elasticity = spend_elasticity if spend_ratio <= 1.5 else min(spend_elasticity * 1.2, 0.35)
+        spend_impact = (spend_ratio ** eff_elasticity)
         
-        pred = effective_damping * lag1 + (1.0 - effective_damping) * pred_raw
+        # Promo lift applied to raw prediction
+        promo_impact = 1.0
+        if fc.loc[i, "Discount_Lift"] > 5:
+            lift_scale = min(fc.loc[i, "Discount_Lift"] / 20.0, 1.0)
+            promo_impact = 1.0 + (promo_lift_factor - 1.0) * lift_scale
+
+        # CALCULATE FINAL PREDICTION
+        # Mix the previous day (lag) with the new model-driven insight
+        # We lower the lag weight to 0.4 to prevent "memory" growth
+        pred = (0.4 * lag1) + (0.6 * pred_raw * spend_impact * promo_impact)
+
+        # APPLY SAFETY CAPS
+        # 1. Day-to-day cap (prevents vertical spikes)
+        change_cap = max_daily_change_pct if not is_promo_day else max_daily_change_pct * 2
+        pred = np.clip(pred, lag1 * (1 - change_cap), lag1 * (1 + change_cap))
         
-        # ---------------------------------------------------------------------
-        # IMPROVED STABILIZER 2: Delayed mean reversion
-        # Only apply after initial 7 days, and skip during promo periods
-        # ---------------------------------------------------------------------
-        if i >= 7 and not is_promo_day:
-            pred = (1.0 - reversion_strength) * pred + reversion_strength * baseline_level
-        
-        # ---------------------------------------------------------------------
-        # IMPROVED STABILIZER 3: Asymmetric change cap
-        # Allow bigger upside on promo days, restrict downside more
-        # ---------------------------------------------------------------------
-        if lag1 > 0:
-            if is_promo_day:
-                # More upside allowed on promo days
-                max_up = lag1 * (1.0 + cap * 1.5)  # 50% more upside
-                min_down = lag1 * (1.0 - cap * 0.7)  # Less downside restriction
-            else:
-                max_up = lag1 * (1.0 + cap)
-                min_down = lag1 * (1.0 - cap)
-            
-            pred = float(np.clip(pred, min_down, max_up))
-        
-        # ---------------------------------------------------------------------
-        # IMPROVED: Apply spend adjustment more aggressively
-        # ---------------------------------------------------------------------
-        if abs(spend_ratio - 1.0) > 0.05:  # Apply even for small changes
-            # Use higher effective elasticity for big spend increases
-            effective_elasticity = spend_elasticity
-            if spend_ratio > 1.5:
-                effective_elasticity = min(spend_elasticity * 1.3, 0.40)
-            
-            spend_multiplier = spend_ratio ** effective_elasticity
-            pred *= spend_multiplier
-        
-        # ---------------------------------------------------------------------
-        # NEW: Promotional lift boost
-        # When discount is significantly higher than baseline, apply lift
-        # ---------------------------------------------------------------------
-        discount_lift = fc.loc[i, "Discount_Lift"]
-        if discount_lift > 10 and promo_lift_factor > 1.0:
-            # Scale lift based on discount depth
-            lift_scale = min(discount_lift / 20.0, 1.0)  # Max at 20% extra discount
-            effective_lift = 1.0 + (promo_lift_factor - 1.0) * lift_scale
-            pred *= effective_lift
-        
-        # ---------------------------------------------------------------------
-        # Safety floor & ceiling
-        # ---------------------------------------------------------------------
-        pred = max(pred, 0.0)
-        # Prevent unrealistic explosions (10x baseline)
-        pred = min(pred, baseline_level * 10.0)
-        
-        # ---------------------------------------------------------------------
-        # Store prediction
-        # ---------------------------------------------------------------------
+        # 2. Global ceiling (prevents explosion vs history)
+        ceiling = baseline_level * (6.0 if is_promo_day else 2.5)
+        pred = min(pred, ceiling)
+
+        # Store and Update Buffer
         preds.append(pred)
         logs.append(np.log1p(pred))
-        
-        # ---------------------------------------------------------------------
-        # Update state for next iteration with faster adaptation
-        # ---------------------------------------------------------------------
         hist_units.append(pred)
         
-        # Update rolling windows with adaptive rates
-        roll7 = (1.0 - rolling_update_rate) * roll7 + rolling_update_rate * pred
-        roll30 = (1.0 - rolling_update_rate * 0.5) * roll30 + (rolling_update_rate * 0.5) * pred
-    
+        # Update rolling averages slowly to prevent feedback loops
+        roll7 = (0.8 * roll7) + (0.2 * pred)
+        roll30 = (0.95 * roll30) + (0.05 * pred)
+
     # =========================================================================
-    # 10. FINALIZE FORECAST
+    # 6. FINALIZE
     # =========================================================================
-    fc["Predicted_Units"] = np.array(preds, dtype=float)
-    fc["Predicted_Log_Units"] = np.array(logs, dtype=float)
-    fc["Predicted_Revenue"] = fc["Predicted_Units"] * float(avg_asp)
-    
-    # Add diagnostics
-    fc["Spend_Ratio_vs_Hist"] = float(spend_ratio)
-    fc["Spend_Elasticity"] = float(spend_elasticity)
-    fc["Baseline_Level"] = float(baseline_level)
-    fc["Promo_Lift_Factor"] = float(promo_lift_factor)
-    fc["Stabilization_Mode"] = mode
+    fc["Predicted_Units"] = np.array(preds)
+    fc["Predicted_Log_Units"] = np.array(logs)
+    fc["Predicted_Revenue"] = fc["Predicted_Units"] * avg_asp
     
     return fc
 # =============================================================================
