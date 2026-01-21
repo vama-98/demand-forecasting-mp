@@ -688,40 +688,29 @@ def generate_forecast_recursive(
     stabilization_mode: str = "adaptive", 
     shopify_units_override: pd.Series | None = None,
 ):
-    # --- 1. SETUP & DATA FILTERING ---
+    # --- 1. SETUP ---
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
     hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == channel)].sort_values("Order_date")
     
-    if hist.empty:
-        return None
+    if hist.empty: return None
 
-    # --- 2. THE SEASONAL ANCHOR (Fixes the Flat-Line) ---
-    # We extract the 'True' Day-of-Week pattern from your historical data
-    dow_pattern = hist.groupby(hist['Order_date'].dt.dayofweek)['Units_Sold'].mean()
-    overall_avg = hist['Units_Sold'].mean()
-    # If a Sunday usually does 1.2x average, we save that here
-    seasonal_index = (dow_pattern / overall_avg).to_dict()
-
-    # --- 3. CALENDAR & FEATURES ---
+    # Standard Calendar Features
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
     fc["Week_of_Year"] = fc["Date"].dt.isocalendar().week.astype(int)
     fc["Is_Weekend"] = (fc["Day_of_Week"] >= 5).astype(int)
+    fc["Is_Month_Start"] = (fc["Day_of_Month"] <= 3).astype(int)
+    fc["Is_Month_End"] = (fc["Day_of_Month"] >= 28).astype(int)
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
-    
-    # Static info for features
-    fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
-    fc["Title_Encoded"] = int(title_to_code.get(product, 0))
-    fc["ASP"] = float(hist["ASP"].mean()) if "ASP" in hist.columns else 0.0
-    
-    # Encodings
-    fc = pd.concat([fc, _cyclic_encode(fc["Day_of_Week"], 7, "dow"), 
-                    _cyclic_encode(fc["Month"], 12, "mon"), 
-                    _cyclic_encode(fc["Week_of_Year"], 52, "woy")], axis=1)
 
-    # --- 4. SCENARIO OVERLAYS ---
+    # --- 2. EXTERNAL IMPACTS ---
+    num_days = len(fc)
+    daily_spend_base = float(monthly_spend) / num_days if num_days else 0.0
+    dow_mult = _compute_spend_dow_multiplier(daily_data, product)
+    fc["Spend"] = fc["Day_of_Week"].map(lambda d: dow_mult.get(int(d), 1.0)) * daily_spend_base
+    
     fc["Discount_Pct"] = float(baseline_target_discount)
     fc["Shopify_Discount"] = float(baseline_shopify_discount)
     fc["Is_Promo_Event"] = 0
@@ -736,57 +725,69 @@ def generate_forecast_recursive(
         fc.loc[mask, "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
         fc.loc[mask, "Is_Promo_Event"] = 1
 
-    # --- 5. INITIAL STATE ---
+    # --- 3. MODEL PREP ---
+    fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
+    fc["Title_Encoded"] = int(title_to_code.get(product, 0))
+    fc = pd.concat([fc, _cyclic_encode(fc["Day_of_Week"], 7, "dow"), 
+                    _cyclic_encode(fc["Month"], 12, "mon"), 
+                    _cyclic_encode(fc["Week_of_Year"], 52, "woy")], axis=1)
+
+    # --- 4. RECURSIVE STATE ---
     hist_units = hist["Units_Sold"].tolist()
-    baseline_level = max(float(hist["Units_Sold"].tail(30).median()), 1.0)
+    # Fixed baseline to prevent drifting away from reality
+    fixed_baseline = max(float(hist["Units_Sold"].tail(30).median()), 1.0)
     
-    # Rolling stats (start from history)
     roll7 = float(np.mean(hist_units[-7:]))
     roll30 = float(np.mean(hist_units[-30:]))
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if "Spend_Adstock" in hist.columns else 0.0
 
-    # --- 6. THE LOOP (THE FIX) ---
+    # --- 5. THE LOOP ---
     preds = []
     
     for i in range(len(fc)):
-        # Features
-        lag1 = float(hist_units[-1])
-        # "Safe Lag": If yesterday was a massive spike, don't let it become the new normal
-        safe_lag = np.clip(lag1, baseline_level * 0.3, baseline_level * 3.0)
+        # Adstock
+        prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
+        fc.loc[i, "Spend_Adstock"] = prev_adstock
+        fc.loc[i, "Spend_Sat"] = np.log1p(prev_adstock)
         
-        fc.loc[i, "Units_Lag_1"] = safe_lag
-        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else safe_lag
+        # Lag features
+        lag1 = float(hist_units[-1])
+        fc.loc[i, "Units_Lag_1"] = lag1
+        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
         fc.loc[i, "Units_Rolling_7"] = roll7
         fc.loc[i, "Units_Rolling_30"] = roll30
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
         
-        # XGBoost Prediction
+        # XGBoost Raw Prediction
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_raw = max(float(np.expm1(units_model.predict(X_i)[0])), 0.0)
 
-        # APPLY SEASONAL INDEX: This restores the "bounce"
-        dow = fc.loc[i, "Day_of_Week"]
-        pattern = seasonal_index.get(dow, 1.0)
+        # THE FIX: Decaying Weight
+        # As we get further from the 'start_date', we trust the previous prediction less.
+        # This prevents the exponential snowball.
+        decay = max(0.1, 1.0 - (i / 30.0)) # Gradually shift from 100% responsiveness to 10% over a month
         
-        # FINAL PREDICTION CALCULATION
-        # 70% Model + Seasonal Pattern / 30% Yesterday
-        # This prevents the exponential increase by anchoring to the calendar
-        pred = (0.7 * pred_raw * pattern) + (0.3 * safe_lag)
+        # Combined prediction with a heavy "anchor" to the baseline
+        # This keeps the 'bounce' (from pred_raw) but stops the 'drift' (from lag1)
+        pred = (0.2 * lag1) + (0.8 * pred_raw)
+        
+        # Final smoothing: Pull slightly toward the historical median to prevent explosion
+        pred = (0.7 * pred) + (0.3 * fixed_baseline)
 
-        # SAFETY: Hard limits vs history to prevent Image 1 explosions
+        # Hard caps based on historical volatility
         is_promo = fc.loc[i, "Is_Promo_Event"] == 1
-        ceiling = baseline_level * (5.0 if is_promo else 2.5)
-        pred = np.clip(pred, baseline_level * 0.1, ceiling)
+        ceiling = fixed_baseline * (4.0 if is_promo else 2.0)
+        pred = np.clip(pred, fixed_baseline * 0.2, ceiling)
 
-        # Update
+        # Store
         preds.append(pred)
         hist_units.append(pred)
         
-        # Update rolling windows slowly to prevent "Feedback Loops"
+        # Update rolling windows slowly
         roll7 = (0.8 * roll7) + (0.2 * pred)
-        roll30 = (0.97 * roll30) + (0.03 * pred)
+        roll30 = (0.95 * roll30) + (0.05 * pred)
 
-    # --- 7. OUTPUT ---
+    # --- 6. FINALIZE ---
     fc["Predicted_Units"] = np.array(preds)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * (float(hist["ASP"].mean()) if "ASP" in hist.columns else 0.0)
     fc["Predicted_Log_Units"] = np.log1p(fc["Predicted_Units"])
@@ -1217,33 +1218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
