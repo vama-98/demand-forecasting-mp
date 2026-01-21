@@ -701,6 +701,7 @@ def generate_forecast_recursive(
         st.error(f"No historical data for {product} + {channel}")
         return None
 
+    # Calendar Features
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -722,6 +723,7 @@ def generate_forecast_recursive(
     fc["Shopify_Discount"] = float(baseline_shopify_discount)
     fc["Is_Promo_Event"] = 0
     
+    # Apply scenario overlays
     for offer in shopify_offers:
         mask = fc["Date"].isin(pd.to_datetime(offer.get("dates", [])))
         fc.loc[mask, "Shopify_Discount"] = float(offer.get("discount", baseline_shopify_discount))
@@ -752,13 +754,12 @@ def generate_forecast_recursive(
                     _cyclic_encode(fc["Month"], 12, "mon"), 
                     _cyclic_encode(fc["Week_of_Year"], 52, "woy")], axis=1)
 
-    # Elasticity Calculations
+    # Pre-calculate Spend Ratio vs History
     spend_elasticity = estimate_spend_elasticity(daily_data, product, channel)
     hist_spend_recent = hist["Spend"].tail(60).median()
-    planned_spend_med = fc["Spend"].median()
-    spend_ratio = planned_spend_med / max(hist_spend_recent, 1.0)
+    spend_ratio = (fc["Spend"].median() / max(hist_spend_recent, 1.0))
 
-    # Promotional Lift Factor from history
+    # Historical Promo Lift
     promo_lift_factor = 1.0
     hist_promo = hist[hist["Discount_Pct"] > baseline_target_discount + 10]
     hist_norm = hist[hist["Discount_Pct"] <= baseline_target_discount + 5]
@@ -776,7 +777,7 @@ def generate_forecast_recursive(
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if "Spend_Adstock" in hist.columns else 0.0
 
     # =========================================================================
-    # 5. RECURSIVE LOOP (FIXED)
+    # 5. RECURSIVE LOOP (THE FIX)
     # =========================================================================
     preds, logs = [], []
     
@@ -786,7 +787,7 @@ def generate_forecast_recursive(
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = np.log1p(prev_adstock)
         
-        # Set Lag Features for this step
+        # Assign Lags
         lag1 = float(hist_units[-1])
         fc.loc[i, "Units_Lag_1"] = lag1
         fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
@@ -799,40 +800,39 @@ def generate_forecast_recursive(
         pred_log = float(units_model.predict(X_i)[0])
         pred_raw = max(float(np.expm1(pred_log)), 0.0)
 
-        # Apply Contextual Multipliers (Non-Compounding)
+        # Apply Contextual Multipliers to the RAW model only (not compounding)
         is_promo_day = fc.loc[i, "Is_Promo_Event"] == 1
         
-        # Spend multiplier applied to raw prediction
+        # 1. Spend multiplier
         eff_elasticity = spend_elasticity if spend_ratio <= 1.5 else min(spend_elasticity * 1.2, 0.35)
         spend_impact = (spend_ratio ** eff_elasticity)
         
-        # Promo lift applied to raw prediction
+        # 2. Promo lift
         promo_impact = 1.0
         if fc.loc[i, "Discount_Lift"] > 5:
             lift_scale = min(fc.loc[i, "Discount_Lift"] / 20.0, 1.0)
             promo_impact = 1.0 + (promo_lift_factor - 1.0) * lift_scale
 
-        # CALCULATE FINAL PREDICTION
-        # Mix the previous day (lag) with the new model-driven insight
-        # We lower the lag weight to 0.4 to prevent "memory" growth
-        pred = (0.4 * lag1) + (0.6 * pred_raw * spend_impact * promo_impact)
+        # FINAL CALCULATION: Dampen the lag to prevent snowballing
+        # We only give 30% weight to yesterday, 70% to the fresh model prediction
+        pred = (0.3 * lag1) + (0.7 * pred_raw * spend_impact * promo_impact)
 
-        # APPLY SAFETY CAPS
-        # 1. Day-to-day cap (prevents vertical spikes)
-        change_cap = max_daily_change_pct if not is_promo_day else max_daily_change_pct * 2
-        pred = np.clip(pred, lag1 * (1 - change_cap), lag1 * (1 + change_cap))
+        # SAFETY CIRCUIT BREAKERS
+        # A. Day-over-day cap
+        cap = max_daily_change_pct if not is_promo_day else max_daily_change_pct * 2
+        pred = np.clip(pred, lag1 * (1 - cap), lag1 * (1 + cap))
         
-        # 2. Global ceiling (prevents explosion vs history)
-        ceiling = baseline_level * (6.0 if is_promo_day else 2.5)
+        # B. Absolute ceiling vs history
+        ceiling = baseline_level * (5.0 if is_promo_day else 2.0)
         pred = min(pred, ceiling)
 
-        # Store and Update Buffer
+        # Update Buffer
         preds.append(pred)
         logs.append(np.log1p(pred))
         hist_units.append(pred)
         
-        # Update rolling averages slowly to prevent feedback loops
-        roll7 = (0.8 * roll7) + (0.2 * pred)
+        # Slow down rolling feature updates to prevent feedback loops
+        roll7 = (0.85 * roll7) + (0.15 * pred)
         roll30 = (0.95 * roll30) + (0.05 * pred)
 
     # =========================================================================
@@ -1268,6 +1268,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
