@@ -684,11 +684,11 @@ def generate_forecast_recursive(
     channel_to_code: dict,
     title_to_code: dict,
     adstock_alpha: float = 0.30,
-    max_daily_change_pct: float = 0.35,
+    max_daily_change_pct: float = 0.15,
     stabilization_mode: str = "adaptive", 
     shopify_units_override: pd.Series | None = None,
 ):
-    # --- 1. SETUP (keep as-is) ---
+    # --- 1. SETUP ---
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
     hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == channel)].sort_values("Order_date")
@@ -696,7 +696,7 @@ def generate_forecast_recursive(
     if hist.empty: 
         return None
 
-    # Standard Calendar Features (keep as-is)
+    # Standard Calendar Features
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -706,7 +706,7 @@ def generate_forecast_recursive(
     fc["Is_Month_End"] = (fc["Day_of_Month"] >= 28).astype(int)
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
 
-    # --- 2. EXTERNAL IMPACTS (keep as-is) ---
+    # --- 2. EXTERNAL IMPACTS ---
     num_days = len(fc)
     daily_spend_base = float(monthly_spend) / num_days if num_days else 0.0
     dow_mult = _compute_spend_dow_multiplier(daily_data, product)
@@ -726,7 +726,7 @@ def generate_forecast_recursive(
         fc.loc[mask, "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
         fc.loc[mask, "Is_Promo_Event"] = 1
 
-    # --- 3. MODEL PREP (keep as-is) ---
+    # --- 3. MODEL PREP ---
     fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
     fc["Title_Encoded"] = int(title_to_code.get(product, 0))
     fc = pd.concat([fc, _cyclic_encode(fc["Day_of_Week"], 7, "dow"), 
@@ -753,7 +753,7 @@ def generate_forecast_recursive(
     preds = []
     
     for i in range(len(fc)):
-        # Adstock (keep as-is)
+        # Adstock
         prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = np.log1p(prev_adstock)
@@ -815,7 +815,7 @@ def generate_forecast_recursive(
         roll7 = (0.90 * roll7) + (0.10 * pred)
         roll30 = (0.97 * roll30) + (0.03 * pred)
 
-    # --- 6. FINALIZE (keep as-is) ---
+    # --- 6. FINALIZE ---
     fc["Predicted_Units"] = np.array(preds)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * (float(hist["ASP"].mean()) if "ASP" in hist.columns else 0.0)
     fc["Predicted_Log_Units"] = np.log1p(fc["Predicted_Units"])
@@ -825,37 +825,63 @@ def generate_forecast_recursive(
 # PLOT
 # =============================================================================
 
-def plot_history_vs_forecast(hist_plot, baseline_fc, scenario_fc, forecast_start, show_7dma=True, show_bands=True):
+def plot_history_vs_forecast(hist_plot, baseline_fc, scenario_fc, forecast_start, show_baseline_trend=True, show_bands=True):
     if isinstance(forecast_start, pd.Timestamp):
         forecast_start = forecast_start.to_pydatetime()
 
     fig = go.Figure()
 
+    # Historical actual
     fig.add_trace(go.Scatter(
         x=hist_plot["Order_date"],
         y=hist_plot["Units_Sold"],
         mode="lines",
         name="Historical (Actual)",
+        line=dict(color="rgb(31, 119, 180)", width=1.5),
     ))
 
-    if show_7dma:
+    # Show 30-day median baseline instead of 7DMA
+    if show_baseline_trend and "Units_30D_Median" in hist_plot.columns:
         fig.add_trace(go.Scatter(
             x=hist_plot["Order_date"],
-            y=hist_plot["Units_7DMA"],
+            y=hist_plot["Units_30D_Median"],
             mode="lines",
-            name="Historical (7D Avg)",
-            line=dict(width=3, dash="dot"),
+            name="Historical (30D Median)",
+            line=dict(width=2, dash="dot", color="rgba(100, 149, 237, 0.6)"),
         ))
 
+    # Add horizontal baseline reference line
+    if not hist_plot.empty:
+        recent_baseline = float(hist_plot["Units_Sold"].tail(30).median())
+        fig.add_shape(
+            type="line",
+            x0=hist_plot["Order_date"].min(),
+            x1=hist_plot["Order_date"].max(),
+            y0=recent_baseline,
+            y1=recent_baseline,
+            line=dict(color="rgba(150, 150, 150, 0.3)", width=1, dash="dash"),
+        )
+        fig.add_annotation(
+            x=hist_plot["Order_date"].max(),
+            y=recent_baseline,
+            text=f"30D Baseline: {recent_baseline:.0f}",
+            showarrow=False,
+            xanchor="right",
+            yanchor="bottom",
+            font=dict(size=10, color="gray"),
+        )
+
+    # Baseline forecast
     if baseline_fc is not None and not baseline_fc.empty:
         fig.add_trace(go.Scatter(
             x=baseline_fc["Date"],
             y=baseline_fc["Predicted_Units"],
             mode="lines",
             name="Baseline Forecast",
-            line=dict(width=2, dash="dash"),
+            line=dict(width=2, dash="dash", color="rgb(255, 127, 14)"),
         ))
 
+    # Confidence bands
     if show_bands and scenario_fc is not None and ("Lower" in scenario_fc.columns) and ("Upper" in scenario_fc.columns):
         fig.add_trace(go.Scatter(
             x=scenario_fc["Date"],
@@ -870,21 +896,24 @@ def plot_history_vs_forecast(hist_plot, baseline_fc, scenario_fc, forecast_start
             y=scenario_fc["Lower"],
             mode="lines",
             fill="tonexty",
+            fillcolor="rgba(44, 160, 101, 0.2)",
             line=dict(width=0),
-            name="Scenario Band",
+            name="Confidence Band",
             hoverinfo="skip",
         ))
 
+    # Scenario forecast
     if scenario_fc is not None and not scenario_fc.empty:
         fig.add_trace(go.Scatter(
             x=scenario_fc["Date"],
             y=scenario_fc["Predicted_Units"],
             mode="lines+markers",
             name="Scenario Forecast",
-            marker=dict(size=6),
-            line=dict(width=2),
+            marker=dict(size=5, color="rgb(44, 160, 101)"),
+            line=dict(width=2.5, color="rgb(44, 160, 101)"),
         ))
 
+    # Forecast start line
     fig.add_shape(
         type="line",
         x0=forecast_start,
@@ -958,7 +987,7 @@ def main():
                 st.rerun()
 
         st.markdown("---")
-        show_7dma = st.checkbox("Show 7D moving average", value=True)
+        show_baseline_trend = st.checkbox("Show 30D median baseline", value=True)
         show_bands = st.checkbox("Show confidence bands", value=True)
         band_level = st.selectbox("Band level", ["90%", "95%"], index=0)
         z = 1.64 if band_level == "90%" else 1.96
@@ -1172,11 +1201,62 @@ def main():
                 title_to_code=title_to_code,
                 days=30,
             )
+            
 
             for df_fc in (scenario_fc, baseline_fc):
                 df_fc["Predicted_Units"] *= calib
                 df_fc["Predicted_Revenue"] *= calib
                 df_fc["Predicted_Log_Units"] = np.log1p(np.clip(df_fc["Predicted_Units"].values, 0, None))
+
+            # Display Model Performance Metrics
+            st.markdown("---")
+            st.subheader("📊 Model Performance Metrics")
+
+            metrics = load_training_metrics("training_metrics.json")
+            if metrics:
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                
+                with col_m1:
+                    st.metric(
+                        "MAE (Units)", 
+                        f"{metrics.get('mae_units', 0):,.1f}",
+                        help="Mean Absolute Error on test set"
+                    )
+                
+                with col_m2:
+                    st.metric(
+                        "MAPE", 
+                        f"{metrics.get('mape_units', 0) * 100:.2f}%",
+                        help="Mean Absolute Percentage Error"
+                    )
+                
+                with col_m3:
+                    st.metric(
+                        "WAPE", 
+                        f"{metrics.get('wape_units', 0) * 100:.2f}%",
+                        help="Weighted Absolute Percentage Error"
+                    )
+                
+                with col_m4:
+                    bias_val = metrics.get('bias', 0)
+                    st.metric(
+                        "Bias", 
+                        f"{bias_val * 100:.2f}%",
+                        delta=f"{'Over' if bias_val > 0 else 'Under'}-forecasting" if abs(bias_val) > 0.01 else "Balanced",
+                        help="Forecast bias (positive = over-forecasting, negative = under-forecasting)"
+                    )
+                
+                # Optional: Show training details in expander
+                with st.expander("📋 Training Details"):
+                    st.write(f"**Training rows:** {metrics.get('rows', 'N/A'):,}")
+                    st.write(f"**Features used:** {metrics.get('features', 'N/A')}")
+                    st.write(f"**Train end date:** {metrics.get('train_end_date', 'N/A')}")
+                    st.write(f"**Test start date:** {metrics.get('test_start_date', 'N/A')}")
+                    st.write(f"**Sigma (log-space):** {metrics.get('sigma_units_log', 0):.4f}")
+            else:
+                st.warning("⚠️ Training metrics not found. Please retrain the model to see performance metrics.")
+
+            st.markdown("---")
 
             # Bands
             if show_bands:
@@ -1207,10 +1287,17 @@ def main():
             st.markdown("---")
 
             # History plot (SKU + channel)
-            hist_plot = daily_data[(daily_data["Master_Title"] == selected_product) & (daily_data["Channel"] == selected_channel)][
-                ["Order_date", "Units_Sold"]
-            ].copy().sort_values("Order_date")
-            hist_plot["Units_7DMA"] = hist_plot["Units_Sold"].rolling(7, min_periods=1).mean()
+            # History plot with improved 30D median
+            hist_plot = daily_data[
+                (daily_data["Master_Title"] == selected_product) & 
+                (daily_data["Channel"] == selected_channel)
+            ][["Order_date", "Units_Sold"]].copy().sort_values("Order_date")
+            
+            # Calculate 30-day median (more stable than 7-day mean)
+            hist_plot["Units_30D_Median"] = hist_plot["Units_Sold"].rolling(
+                window=30, 
+                min_periods=1
+            ).median()
 
             forecast_start = pd.to_datetime(start_date).to_pydatetime()
 
@@ -1246,4 +1333,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
