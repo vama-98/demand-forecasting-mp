@@ -1306,7 +1306,7 @@ def main():
                 baseline_fc=baseline_fc,
                 scenario_fc=scenario_fc,
                 forecast_start=forecast_start,
-                show_7dma=show_7dma,
+                show_baseline_trend=show_baseline_trend,
                 show_bands=show_bands,
             )
             st.plotly_chart(fig, use_container_width=True)
