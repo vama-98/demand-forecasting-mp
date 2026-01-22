@@ -688,14 +688,15 @@ def generate_forecast_recursive(
     stabilization_mode: str = "adaptive", 
     shopify_units_override: pd.Series | None = None,
 ):
-    # --- 1. SETUP ---
+    # --- 1. SETUP (keep as-is) ---
     dates = pd.date_range(start=pd.to_datetime(start_date), end=pd.to_datetime(end_date), freq="D")
     fc = pd.DataFrame({"Date": dates})
     hist = daily_data[(daily_data["Master_Title"] == product) & (daily_data["Channel"] == channel)].sort_values("Order_date")
     
-    if hist.empty: return None
+    if hist.empty: 
+        return None
 
-    # Standard Calendar Features
+    # Standard Calendar Features (keep as-is)
     fc["Day_of_Week"] = fc["Date"].dt.dayofweek
     fc["Day_of_Month"] = fc["Date"].dt.day
     fc["Month"] = fc["Date"].dt.month
@@ -705,7 +706,7 @@ def generate_forecast_recursive(
     fc["Is_Month_End"] = (fc["Day_of_Month"] >= 28).astype(int)
     fc["Is_Payday_Window"] = fc["Day_of_Month"].isin([28, 29, 30, 31, 1, 2, 3]).astype(int)
 
-    # --- 2. EXTERNAL IMPACTS ---
+    # --- 2. EXTERNAL IMPACTS (keep as-is) ---
     num_days = len(fc)
     daily_spend_base = float(monthly_spend) / num_days if num_days else 0.0
     dow_mult = _compute_spend_dow_multiplier(daily_data, product)
@@ -725,35 +726,50 @@ def generate_forecast_recursive(
         fc.loc[mask, "Discount_Pct"] = float(sale.get("discount", baseline_target_discount))
         fc.loc[mask, "Is_Promo_Event"] = 1
 
-    # --- 3. MODEL PREP ---
+    # --- 3. MODEL PREP (keep as-is) ---
     fc["Channel_Encoded"] = int(channel_to_code.get(channel, 0))
     fc["Title_Encoded"] = int(title_to_code.get(product, 0))
     fc = pd.concat([fc, _cyclic_encode(fc["Day_of_Week"], 7, "dow"), 
                     _cyclic_encode(fc["Month"], 12, "mon"), 
                     _cyclic_encode(fc["Week_of_Year"], 52, "woy")], axis=1)
 
-    # --- 4. RECURSIVE STATE ---
+    # --- 4. IMPROVED RECURSIVE STATE ---
     hist_units = hist["Units_Sold"].tolist()
-    # Fixed baseline to prevent drifting away from reality
-    fixed_baseline = max(float(hist["Units_Sold"].tail(30).median()), 1.0)
     
-    roll7 = float(np.mean(hist_units[-7:]))
-    roll30 = float(np.mean(hist_units[-30:]))
+    # Stronger baseline anchors
+    recent_median = float(hist["Units_Sold"].tail(30).median())
+    recent_mean = float(hist["Units_Sold"].tail(30).mean())
+    fixed_baseline = max(recent_median, 1.0)
+    
+    # Conservative initial rolling values
+    roll7 = float(np.median(hist_units[-7:])) if len(hist_units) >= 7 else recent_median
+    roll30 = float(np.median(hist_units[-30:])) if len(hist_units) >= 30 else recent_median
     prev_adstock = float(hist["Spend_Adstock"].iloc[-1]) if "Spend_Adstock" in hist.columns else 0.0
 
-    # --- 5. THE LOOP ---
+    # Track prediction history for stabilization
+    prediction_buffer = []
+
+    # --- 5. IMPROVED RECURSIVE LOOP ---
     preds = []
     
     for i in range(len(fc)):
-        # Adstock
+        # Adstock (keep as-is)
         prev_adstock = _adstock_next(prev_adstock, float(fc.loc[i, "Spend"]), adstock_alpha)
         fc.loc[i, "Spend_Adstock"] = prev_adstock
         fc.loc[i, "Spend_Sat"] = np.log1p(prev_adstock)
         
-        # Lag features
-        lag1 = float(hist_units[-1])
+        # Lag features - use HISTORICAL data for early predictions
+        if len(prediction_buffer) < 7:
+            # Use actual history for first week
+            lag1 = float(hist_units[-1]) if hist_units else fixed_baseline
+            lag7 = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
+        else:
+            # Gradually transition to predictions
+            lag1 = prediction_buffer[-1]
+            lag7 = prediction_buffer[-7] if len(prediction_buffer) >= 7 else lag1
+        
         fc.loc[i, "Units_Lag_1"] = lag1
-        fc.loc[i, "Units_Lag_7"] = float(hist_units[-7]) if len(hist_units) >= 7 else lag1
+        fc.loc[i, "Units_Lag_7"] = lag7
         fc.loc[i, "Units_Rolling_7"] = roll7
         fc.loc[i, "Units_Rolling_30"] = roll30
         fc.loc[i, "Discount_Gap"] = float(fc.loc[i, "Discount_Pct"] - fc.loc[i, "Shopify_Discount"])
@@ -762,32 +778,44 @@ def generate_forecast_recursive(
         X_i = _ensure_features(fc.loc[[i]], feature_cols).astype(float)
         pred_raw = max(float(np.expm1(units_model.predict(X_i)[0])), 0.0)
 
-        # THE FIX: Decaying Weight
-        # As we get further from the 'start_date', we trust the previous prediction less.
-        # This prevents the exponential snowball.
-        decay = max(0.1, 1.0 - (i / 30.0)) # Gradually shift from 100% responsiveness to 10% over a month
-        
-        # Combined prediction with a heavy "anchor" to the baseline
-        # This keeps the 'bounce' (from pred_raw) but stops the 'drift' (from lag1)
-        pred = (0.2 * lag1) + (0.8 * pred_raw)
-        
-        # Final smoothing: Pull slightly toward the historical median to prevent explosion
-        pred = (0.7 * pred) + (0.3 * fixed_baseline)
-
-        # Hard caps based on historical volatility
+        # IMPROVED: Multi-stage stabilization
         is_promo = fc.loc[i, "Is_Promo_Event"] == 1
-        ceiling = fixed_baseline * (4.0 if is_promo else 2.0)
-        pred = np.clip(pred, fixed_baseline * 0.2, ceiling)
-
-        # Store
-        preds.append(pred)
-        hist_units.append(pred)
         
-        # Update rolling windows slowly
-        roll7 = (0.8 * roll7) + (0.2 * pred)
-        roll30 = (0.95 * roll30) + (0.05 * pred)
+        # Stage 1: Blend with lag (less aggressive)
+        pred_step1 = (0.75 * pred_raw) + (0.25 * lag1)
+        
+        # Stage 2: Anchor to baseline (stronger pull)
+        baseline_weight = 0.4 if is_promo else 0.5  # Less anchor during promos
+        pred_step2 = (1 - baseline_weight) * pred_step1 + baseline_weight * fixed_baseline
+        
+        # Stage 3: Apply realistic caps based on historical volatility
+        hist_std = float(hist["Units_Sold"].tail(60).std())
+        hist_max = float(hist["Units_Sold"].tail(60).quantile(0.95))
+        
+        if is_promo:
+            ceiling = min(hist_max * 2.0, fixed_baseline * 3.5)
+        else:
+            ceiling = min(hist_max * 1.2, fixed_baseline * 1.5)
+        
+        floor = max(fixed_baseline * 0.3, recent_median * 0.5)
+        
+        pred = np.clip(pred_step2, floor, ceiling)
+        
+        # Stage 4: Smooth out erratic jumps
+        if len(prediction_buffer) > 0:
+            max_change = prediction_buffer[-1] * (1 + max_daily_change_pct)
+            min_change = prediction_buffer[-1] * (1 - max_daily_change_pct)
+            pred = np.clip(pred, min_change, max_change)
 
-    # --- 6. FINALIZE ---
+        # Store prediction
+        preds.append(pred)
+        prediction_buffer.append(pred)
+        
+        # Update rolling windows SLOWLY to prevent drift
+        roll7 = (0.90 * roll7) + (0.10 * pred)
+        roll30 = (0.97 * roll30) + (0.03 * pred)
+
+    # --- 6. FINALIZE (keep as-is) ---
     fc["Predicted_Units"] = np.array(preds)
     fc["Predicted_Revenue"] = fc["Predicted_Units"] * (float(hist["ASP"].mean()) if "ASP" in hist.columns else 0.0)
     fc["Predicted_Log_Units"] = np.log1p(fc["Predicted_Units"])
@@ -1218,3 +1246,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
