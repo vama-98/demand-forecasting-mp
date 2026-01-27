@@ -1225,19 +1225,12 @@ def main():
                 
                 with col_m2:
                     st.metric(
-                        "MAPE", 
-                        f"{metrics.get('mape_units', 0) * 100:.2f}%",
-                        help="Mean Absolute Percentage Error"
-                    )
-                
-                with col_m3:
-                    st.metric(
                         "WAPE", 
                         f"{metrics.get('wape_units', 0) * 100:.2f}%",
                         help="Weighted Absolute Percentage Error"
                     )
                 
-                with col_m4:
+                with col_m3:
                     bias_val = metrics.get('bias', 0)
                     st.metric(
                         "Bias", 
@@ -1333,5 +1326,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
